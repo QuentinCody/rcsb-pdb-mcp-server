@@ -1,50 +1,65 @@
-# Building a Remote MCP Server on Cloudflare (Without Auth)
+# RCSB PDB Explorer: An AI Assistant for Protein Data
 
-This example allows you to deploy a remote MCP server that doesn't require authentication on Cloudflare Workers. 
+This project provides an "AI assistant" (called an MCP Server) that's specialized in understanding and retrieving information from the RCSB Protein Data Bank (PDB). Think of it as a helper that allows advanced AI models, like Claude, to directly access and use PDB data to answer your questions.
 
-## Get started: 
+## What can it do?
 
-[![Deploy to Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/ai/tree/main/demos/remote-mcp-authless)
+With this server, you can ask an AI (like Claude, when connected) to:
+*   Fetch details about specific PDB entries (e.g., "What is the experimental method used for PDB entry 4HHB?").
+*   Retrieve information about molecules, sequences, and experimental data.
+*   Query Computed Structure Models (CSMs).
+*   And much more, by giving the AI the ability to make specific queries to the PDB's GraphQL API.
 
-This will deploy your MCP server to a URL like: `remote-mcp-server-authless.<your-account>.workers.dev/sse`
+Essentially, it bridges the gap between conversational AI and the rich, structured data available in the RCSB PDB.
 
-Alternatively, you can use the command line below to get the remote MCP Server created on your local machine:
-```bash
-npm create cloudflare@latest -- my-mcp-server --template=cloudflare/ai/demos/remote-mcp-authless
-```
+## How to Use This AI Assistant (for an Existing Server)
 
-## Customizing your MCP Server
+If this AI assistant has already been set up and deployed (e.g., by a colleague or IT department), you can connect to it using a compatible AI interface. Here are a couple of common ways:
 
-To add your own [tools](https://developers.cloudflare.com/agents/model-context-protocol/tools/) to the MCP server, define each tool inside the `init()` method of `src/index.ts` using `this.server.tool(...)`. 
+### 1. Using the Cloudflare AI Playground
 
-## Connect to Cloudflare AI Playground
+The Cloudflare AI Playground is a website where you can test AI models and connect them to "tools" like this PDB Explorer.
 
-You can connect to your MCP server from the Cloudflare AI Playground, which is a remote MCP client:
+1.  **Get the Server URL**: You'll need the specific web address (URL) of the deployed RCSB PDB Explorer server. It will look something like `https://rcsb-pdb-mcp-server.<your-organization>.workers.dev/sse`.
+2.  **Go to the AI Playground**: Open your web browser and navigate to [https://playground.ai.cloudflare.com/](https://playground.ai.cloudflare.com/).
+3.  **Connect Your Server**:
+    *   Look for an option to add or connect a "Custom MCP Server" or "Tool Server."
+    *   Enter the Server URL you obtained in step 1.
+4.  **Start Querying**: Once connected, you can chat with the AI in the playground. When you ask questions related to PDB data, the AI will be able to use the PDB Explorer to find answers. For example, try asking: "Get the title and experimental method for PDB ID 1EHZ."
 
-1. Go to https://playground.ai.cloudflare.com/
-2. Enter your deployed MCP server URL (`remote-mcp-server-authless.<your-account>.workers.dev/sse`)
-3. You can now use your MCP tools directly from the playground!
+### 2. Using the Claude Desktop App
 
-## Connect Claude Desktop to your MCP server
+If you use the Claude Desktop application, you can configure it to connect to this PDB Explorer. This allows Claude to use the PDB tools directly within your desktop app.
 
-You can also connect to your remote MCP server from local MCP clients, by using the [mcp-remote proxy](https://www.npmjs.com/package/mcp-remote). 
+1.  **Get the Server URL**: Just like with the AI Playground, you need the URL of the deployed RCSB PDB Explorer server (e.g., `https://rcsb-pdb-mcp-server.quentincody.workers.dev/sse`).
+2.  **Configure Claude Desktop**:
+    *   Open the Claude Desktop app.
+    *   Go to `Settings` > `Developer` > `Edit Config`. This will open a JSON configuration file.
+    *   You need to add an entry for the PDB Explorer. It should look like this (you might have other servers already listed):
 
-To connect to your MCP server from Claude Desktop, follow [Anthropic's Quickstart](https://modelcontextprotocol.io/quickstart/user) and within Claude Desktop go to Settings > Developer > Edit Config.
+    ```json
+    {
+      "mcpServers": {
+        // ... (other servers might be here) ...
 
-Update with this configuration:
-
-```json
-{
-  "mcpServers": {
-    "calculator": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "http://localhost:8787/sse"  // or remote-mcp-server-authless.your-account.workers.dev/sse
-      ]
+        "rcsb-pdb": {
+          "command": "npx",
+          "args": [
+            "mcp-remote",
+            "YOUR_RCSB_PDB_SERVER_URL_HERE" // <-- Replace this with the actual server URL
+          ]
+        }
+      }
     }
-  }
-}
-```
+    ```
+    *   **Important**: Replace `"YOUR_RCSB_PDB_SERVER_URL_HERE"` with the actual URL you got in step 1. For example: `"https://rcsb-pdb-mcp-server.quentincody.workers.dev/sse"`.
+3.  **Restart Claude**: Close and reopen the Claude Desktop app.
+4.  **Use the Tool**: Now, when you chat with Claude, it will have access to the RCSB PDB Explorer. You can ask it questions like: "Fetch the abstract for PDB entry 2DRI."
 
-Restart Claude and you should see the tools become available. 
+## For Developers (Setting up your own server)
+
+If you are a developer and want to deploy your own instance of this server or customize it, please refer to the original template and documentation for [Cloudflare Workers AI demos](https://github.com/cloudflare/ai/tree/main/demos/remote-mcp-authless). The core logic for this PDB tool is in `src/index.ts`.
+
+---
+
+This README aims to make it easier for scientists to leverage the power of AI with their PDB research data. Enjoy exploring!
