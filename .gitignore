@@ -3,3 +3,7 @@ node_modules
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Test and debug files
+test*.js
+debug*.js

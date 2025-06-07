@@ -119,33 +119,34 @@ export class SchemaInferenceEngine {
 	}
 	
 	inferFromJSON(data: any): Record<string, TableSchema> {
-		// Reset state for new inference
+		// Clear previous state
 		this.discoveredEntities.clear();
 		this.entityRelationships.clear();
-		this.indexSuggestions.clear();
 		
+		// Initialize with empty schemas object
 		const schemas: Record<string, TableSchema> = {};
 		
-		// Enhanced entity discovery with forced normalization
-		this.discoverEntitiesAggressively(data, []);
-		
-		// Only fall back to simple schemas if truly no entities found AND data is primitive
-		if (this.discoveredEntities.size === 0) {
-			if (this.isPrimitiveData(data)) {
-				const tableName = Array.isArray(data) ? 'data_array' : 'data_scalar';
-				schemas[tableName] = this.createSchemaFromPrimitiveOrSimpleArray(data, tableName);
-			} else {
-				// Force entity extraction even for complex objects
-				this.forceEntityExtraction(data, schemas);
-			}
-		} else {
-			this.createSchemasFromEntities(schemas);
+		if (data === null || data === undefined) {
+			return schemas;
 		}
-
-		// Add foreign key constraints and indexes
-		this.addRelationalConstraints(schemas);
-		this.addIndexSuggestions(schemas);
-
+		
+		// Force aggressive entity extraction for complex structure
+		this.forceEntityExtraction(data, schemas);
+		
+		// Process discovered entities
+		if (this.discoveredEntities.size > 0) {
+			this.createSchemasFromEntities(schemas);
+			this.createJunctionTableSchemas(schemas);
+			this.addRelationalConstraints(schemas);
+			this.addIndexSuggestions(schemas);
+		} else if (this.isPrimitiveData(data)) {
+			// Handle primitive or simple data
+			schemas['data'] = this.createSchemaFromPrimitiveOrSimpleArray(data, 'data');
+		} else {
+			// Single object case
+			schemas['entry'] = this.createSchemaFromObject(data, 'entry');
+		}
+		
 		return schemas;
 	}
 	
@@ -159,37 +160,46 @@ export class SchemaInferenceEngine {
 	}
 	
 	private forceEntityExtraction(data: any, schemas: Record<string, TableSchema>): void {
-		// Aggressively extract entities from complex objects that didn't get detected
-		if (Array.isArray(data) && data.length > 0) {
-			// Check if array items have common structure
-			const firstItem = data[0];
-			if (typeof firstItem === 'object' && firstItem !== null) {
-				const entityType = this.generateEntityName([], Object.keys(firstItem));
-				this.discoveredEntities.set(entityType, data);
-				this.createSchemasFromEntities(schemas);
-				return;
-			}
-		}
+		// Use aggressive entity discovery first
+		this.discoverEntitiesAggressively(data, []);
 		
-		if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
-			// Check for nested arrays or objects that could be entities
-			for (const [key, value] of Object.entries(data)) {
-				if (Array.isArray(value) && value.length > 0) {
-					const firstItem = value[0];
-					if (typeof firstItem === 'object' && firstItem !== null) {
-						const entityType = this.generateEntityName([key], Object.keys(firstItem));
-						this.discoveredEntities.set(entityType, value);
-					}
+		// If that didn't find entities, fall back to forced extraction
+		if (this.discoveredEntities.size === 0) {
+			if (Array.isArray(data) && data.length > 0) {
+				// Check if array items have common structure
+				const firstItem = data[0];
+				if (typeof firstItem === 'object' && firstItem !== null) {
+					const entityType = this.generateEntityName([], Object.keys(firstItem));
+					this.discoveredEntities.set(entityType, data);
+					return;
 				}
 			}
 			
-			if (this.discoveredEntities.size === 0) {
-				// Last resort: create a main table from the root object
-				const entityType = 'main_data';
-				this.discoveredEntities.set(entityType, [data]);
+			if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+				// Check for nested arrays or objects that could be entities
+				for (const [key, value] of Object.entries(data)) {
+					if (Array.isArray(value) && value.length > 0) {
+						const firstItem = value[0];
+						if (typeof firstItem === 'object' && firstItem !== null) {
+							const entityType = this.generateEntityName([key], Object.keys(firstItem));
+							this.discoveredEntities.set(entityType, value);
+							
+							// Record relationship if this is nested under a parent entity
+							if (Object.keys(data).some(k => ['id', 'rcsb_id', '_id'].includes(k))) {
+								const parentEntityType = this.generateEntityName([], Object.keys(data));
+								this.discoveredEntities.set(parentEntityType, [data]);
+								this.recordRelationship(parentEntityType, entityType);
+							}
+						}
+					}
+				}
+				
+				if (this.discoveredEntities.size === 0) {
+					// Last resort: create a main table from the root object
+					const entityType = 'entry';  // Use 'entry' for PDB data
+					this.discoveredEntities.set(entityType, [data]);
+				}
 			}
-			
-			this.createSchemasFromEntities(schemas);
 		}
 	}
 	
@@ -413,35 +423,44 @@ export class SchemaInferenceEngine {
 	}
 	
 	private createSchemasFromEntities(schemas: Record<string, TableSchema>): void {
-		// Create main entity tables
 		for (const [entityType, entities] of this.discoveredEntities.entries()) {
+			const tableName = this.sanitizeTableName(entityType);
+			
 			if (entities.length === 0) continue;
 			
 			const columnTypes: Record<string, Set<string>> = {};
 			const sampleData: any[] = [];
 			
-			entities.forEach((entity, index) => {
-				if (index < 3) {
-					sampleData.push(this.extractEntityFields(entity, columnTypes, entityType));
-				} else {
-					this.extractEntityFields(entity, columnTypes, entityType);
-				}
-			});
+			// Extract fields from first few entities
+			const sampleSize = Math.min(entities.length, 3);
+			for (let i = 0; i < sampleSize; i++) {
+				const rowData = this.extractEntityFields(entities[i], columnTypes, entityType);
+				sampleData.push(rowData);
+			}
 			
-			const columns = this.resolveColumnTypes(columnTypes, entityType);
-			this.ensureIdColumn(columns, entityType);
+			// Process remaining entities to continue type discovery
+			for (let i = sampleSize; i < entities.length; i++) {
+				this.extractEntityFields(entities[i], columnTypes, entityType);
+			}
 			
-			schemas[entityType] = {
+			const columns = this.resolveColumnTypes(columnTypes, tableName);
+			this.ensureIdColumn(columns, tableName);
+			
+			schemas[tableName] = {
 				columns,
 				sample_data: sampleData
 			};
 			
-			// Track suggested indexes
-			this.suggestIndexesForTable(entityType, columns);
+			// Add foreign key columns for related entities
+			const relatedTables = this.entityRelationships.get(tableName);
+			if (relatedTables) {
+				for (const relatedTable of relatedTables) {
+					this.addForeignKeyColumn(schemas[tableName], relatedTable, tableName);
+				}
+			}
+			
+			this.suggestIndexesForTable(tableName, columns);
 		}
-		
-		// Create junction tables for many-to-many relationships
-		this.createJunctionTableSchemas(schemas);
 	}
 	
 	private extractEntityFields(obj: any, columnTypes: Record<string, Set<string>>, entityType: string): any {
@@ -475,22 +494,20 @@ export class SchemaInferenceEngine {
 					const foreignKeyColumn = columnName + '_id';
 					const inferredType = this.inferTypeFromName(foreignKeyColumn) || 'INTEGER';
 					this.addColumnType(columnTypes, foreignKeyColumn, inferredType);
-					rowData[foreignKeyColumn] = (value as any).id || (value as any).rcsb_id || null;
+					// Don't set the foreign key value here - let DataInsertionEngine handle it
 				} else {
-					// Flatten simple nested objects
-					if (this.hasOnlyScalarFields(value)) {
-						for (const [subKey, subValue] of Object.entries(value)) {
-							if (!Array.isArray(subValue) && (typeof subValue !== 'object' || subValue === null)) {
-								const prefixedColumn = columnName + '_' + this.sanitizeColumnName(subKey);
-								const inferredType = this.inferTypeFromName(prefixedColumn) || this.getSQLiteType(subValue);
-								this.addColumnType(columnTypes, prefixedColumn, inferredType);
-								rowData[prefixedColumn] = typeof subValue === 'boolean' ? (subValue ? 1 : 0) : subValue;
-							}
-						}
-					} else {
-						// Store complex object as JSON
-						this.addColumnType(columnTypes, columnName, 'JSON');
-						rowData[columnName] = JSON.stringify(value);
+					// Always extract nested scalar fields from ANY nested object
+					const nestedFields = this.extractNestedScalarFields(value, columnName);
+					for (const [nestedColumn, nestedValue] of Object.entries(nestedFields)) {
+						const inferredType = this.inferTypeFromName(nestedColumn) || this.getSQLiteType(nestedValue);
+						this.addColumnType(columnTypes, nestedColumn, inferredType);
+						rowData[nestedColumn] = typeof nestedValue === 'boolean' ? (nestedValue ? 1 : 0) : nestedValue;
+					}
+					
+					// Only store as JSON if it has complex nested structure AND we got no useful fields
+					if (Object.keys(nestedFields).length === 0 || this.hasComplexNestedStructure(value)) {
+						this.addColumnType(columnTypes, columnName + '_json', 'JSON');
+						rowData[columnName + '_json'] = JSON.stringify(value);
 					}
 				}
 			} else {
@@ -504,11 +521,76 @@ export class SchemaInferenceEngine {
 		return rowData;
 	}
 	
+	private extractNestedScalarFields(obj: any, parentKey: string): Record<string, any> {
+		const fields: Record<string, any> = {};
+		
+		if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+			return fields;
+		}
+		
+		for (const [key, value] of Object.entries(obj)) {
+			const semanticSubKey = this.getSemanticColumnName(key);
+			const prefixedColumn = parentKey + '_' + this.sanitizeColumnName(semanticSubKey);
+			
+			if (value === null || typeof value !== 'object') {
+				// Direct scalar value - always extract
+				fields[prefixedColumn] = value;
+			} else if (Array.isArray(value)) {
+				// Handle primitive arrays
+				if (value.length <= 5 && value.every(v => typeof v !== 'object' || v === null)) {
+					fields[prefixedColumn] = JSON.stringify(value);
+				}
+			} else {
+				// Nested object - go deeper if it looks like it has useful scalar data
+				if (this.hasOnlyScalarFields(value)) {
+					// Extract all scalar fields from this nested object
+					const nestedFields = this.extractNestedScalarFields(value, prefixedColumn);
+					Object.assign(fields, nestedFields);
+				} else {
+					// If mixed content, still try to extract scalar fields at this level
+					for (const [nestedKey, nestedValue] of Object.entries(value)) {
+						if (nestedValue === null || typeof nestedValue !== 'object') {
+							const nestedColumnName = prefixedColumn + '_' + this.sanitizeColumnName(this.getSemanticColumnName(nestedKey));
+							fields[nestedColumnName] = nestedValue;
+						}
+					}
+				}
+			}
+		}
+		
+		return fields;
+	}
+	
+	private isImportantPDBField(fieldName: string): boolean {
+		const importantFields = [
+			'entity_poly', 'rcsb_polymer_entity', 'rcsb_entry_info', 'struct', 
+			'exptl', 'cell', 'symmetry', 'diffrn', 'reflns', 'chem_comp',
+			'rcsb_chem_comp_descriptor', 'nonpolymer_comp', 'citation'
+		];
+		return importantFields.includes(fieldName.toLowerCase());
+	}
+	
+	private hasComplexNestedStructure(obj: any): boolean {
+		if (!obj || typeof obj !== 'object') return false;
+		
+		// Check if object has nested objects or arrays of objects
+		for (const value of Object.values(obj)) {
+			if (Array.isArray(value) && value.some(item => typeof item === 'object' && item !== null)) {
+				return true;
+			}
+			if (typeof value === 'object' && value !== null && !this.hasOnlyScalarFields(value)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	
 	private hasOnlyScalarFields(obj: any): boolean {
 		if (!obj || typeof obj !== 'object') return false;
 		const values = Object.values(obj);
-		return values.length <= 5 && values.every(value => 
-			typeof value !== 'object' || value === null
+		return values.length <= 10 && values.every(value => 
+			typeof value !== 'object' || value === null || 
+			(Array.isArray(value) && value.every(v => typeof v !== 'object' || v === null))
 		);
 	}
 	
@@ -815,5 +897,21 @@ export class SchemaInferenceEngine {
 		}
 		
 		return result;
+	}
+
+	private addForeignKeyColumn(schema: TableSchema, referencedTableName: string, parentTableName: string): void {
+		const foreignKeyColumn = `${referencedTableName}_id`;
+		
+		// Only add if not already present
+		if (!schema.columns[foreignKeyColumn]) {
+			schema.columns[foreignKeyColumn] = `INTEGER REFERENCES ${referencedTableName}(id)`;
+			schema.relationships = schema.relationships || {};
+			schema.relationships[foreignKeyColumn] = {
+				type: 'foreign_key',
+				target_table: referencedTableName,
+				foreign_key_column: foreignKeyColumn
+			};
+			console.log(`Added foreign key column: ${parentTableName}.${foreignKeyColumn} -> ${referencedTableName}(id)`);
+		}
 	}
 } 

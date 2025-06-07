@@ -2,8 +2,11 @@ import { TableSchema } from "./types.js";
 
 export class DataInsertionEngine {
 	private processedEntities: Map<string, Map<any, number>> = new Map();
+	private entityToRowMap: Map<any, { tableName: string; id: number }> = new Map();
 	private relationshipData: Map<string, Set<string>> = new Map();
 	private semanticMappings: Map<string, string> = new Map();
+	private foreignKeyUpdates: Array<{ tableName: string; id: number; columnName: string; referencedId: number }> = [];
+	private entityIdCounter: number = 1; // For generating sequential IDs
 	
 	constructor() {
 		this.initializeSemanticMappings();
@@ -58,7 +61,10 @@ export class DataInsertionEngine {
 	async insertData(data: any, schemas: Record<string, TableSchema>, sql: any): Promise<void> {
 		// Reset state for new insertion
 		this.processedEntities.clear();
+		this.entityToRowMap.clear();
 		this.relationshipData.clear();
+		this.foreignKeyUpdates = [];
+		this.entityIdCounter = 1;
 
 		const schemaNames = Object.keys(schemas);
 
@@ -80,20 +86,26 @@ export class DataInsertionEngine {
 			return;
 		}
 
-		// Phase 1: Insert all entities first (to establish primary keys)
-		await this.insertAllEntities(data, schemas, sql);
+		// PHASE 1: Insert all entities first (without foreign keys)
+		console.log("Phase 1: Inserting all entities without foreign keys...");
+		await this.insertAllEntitiesWithoutForeignKeys(data, schemas, sql);
 		
-		// Phase 2: Handle relationships via junction tables (only for tables with data)
+		// PHASE 2: Update foreign key relationships
+		console.log("Phase 2: Updating foreign key relationships...");
+		await this.updateForeignKeyRelationships(data, schemas, sql);
+		
+		// PHASE 3: Handle many-to-many relationships via junction tables
+		console.log("Phase 3: Creating junction table relationships...");
 		await this.insertJunctionTableRecords(data, schemas, sql);
 	}
 
-	private async insertAllEntities(obj: any, schemas: Record<string, TableSchema>, sql: any, path: string[] = []): Promise<void> {
+	private async insertAllEntitiesWithoutForeignKeys(obj: any, schemas: Record<string, TableSchema>, sql: any, path: string[] = []): Promise<void> {
 		if (!obj || typeof obj !== 'object') return;
 		
 		// Handle arrays of entities
 		if (Array.isArray(obj)) {
 			for (const item of obj) {
-				await this.insertAllEntities(item, schemas, sql, path);
+				await this.insertAllEntitiesWithoutForeignKeys(item, schemas, sql, path);
 			}
 			return;
 		}
@@ -102,210 +114,403 @@ export class DataInsertionEngine {
 		if (obj.edges && Array.isArray(obj.edges)) {
 			const nodes = obj.edges.map((edge: any) => edge.node).filter(Boolean);
 			for (const node of nodes) {
-				await this.insertAllEntities(node, schemas, sql, path);
+				await this.insertAllEntitiesWithoutForeignKeys(node, schemas, sql, path);
 			}
 			return;
 		}
 		
-		// Handle individual entities with enhanced detection
+		// Handle individual entities - insert this entity first if it matches a schema
 		if (this.isEntityOrCouldBeEntity(obj)) {
 			const entityType = this.inferEntityType(obj, path);
 			if (schemas[entityType]) {
-				await this.insertEntityRecord(obj, entityType, schemas[entityType], sql);
-				
-				// Process nested entities and record relationships
-				await this.processEntityRelationships(obj, entityType, schemas, sql, path);
+				const insertedId = await this.insertEntityRecordWithoutForeignKeys(obj, entityType, schemas[entityType], sql);
+				if (insertedId) {
+					this.entityToRowMap.set(obj, { tableName: entityType, id: insertedId });
+					console.log(`Tracked entity: ${entityType}(${insertedId})`);
+				}
 			}
 		}
 		
-		// Recursively explore nested objects
+		// Recursively explore nested objects to find more entities
 		for (const [key, value] of Object.entries(obj)) {
-			await this.insertAllEntities(value, schemas, sql, [...path, key]);
+			await this.insertAllEntitiesWithoutForeignKeys(value, schemas, sql, [...path, key]);
 		}
 	}
 	
-	private async processEntityRelationships(entity: any, entityType: string, schemas: Record<string, TableSchema>, sql: any, path: string[]): Promise<void> {
-		for (const [key, value] of Object.entries(entity)) {
-			if (Array.isArray(value) && value.length > 0) {
-				// Check if this array contains entities
-				const firstItem = value.find(item => this.isEntityOrCouldBeEntity(item));
-				if (firstItem) {
-					const relatedEntityType = this.inferEntityType(firstItem, [key]);
-					
-					// Process all entities in this array and record relationships
-					for (const item of value) {
-						if (this.isEntityOrCouldBeEntity(item) && schemas[relatedEntityType]) {
-							await this.insertEntityRecord(item, relatedEntityType, schemas[relatedEntityType], sql);
-							
-							// Track this relationship for junction table creation
-							const relationshipKey = [entityType, relatedEntityType].sort().join('_');
-							const relationships = this.relationshipData.get(relationshipKey) || new Set();
-							const entityId = this.getEntityId(entity, entityType);
-							const relatedId = this.getEntityId(item, relatedEntityType);
-							
-							if (entityId && relatedId) {
-								relationships.add(`${entityId}_${relatedId}`);
-								this.relationshipData.set(relationshipKey, relationships);
-							}
-							
-							// Recursively process nested entities
-							await this.processEntityRelationships(item, relatedEntityType, schemas, sql, [...path, key]);
-						}
-					}
-				}
-			} else if (value && typeof value === 'object' && this.isEntityOrCouldBeEntity(value)) {
-				// Single related entity
-				const relatedEntityType = this.inferEntityType(value, [key]);
-				if (schemas[relatedEntityType]) {
-					await this.insertEntityRecord(value, relatedEntityType, schemas[relatedEntityType], sql);
-					await this.processEntityRelationships(value, relatedEntityType, schemas, sql, [...path, key]);
-				}
-			}
-		}
-	}
-	
-	private async insertEntityRecord(entity: any, tableName: string, schema: TableSchema, sql: any): Promise<number | null> {
+	private async insertEntityRecordWithoutForeignKeys(entity: any, tableName: string, schema: TableSchema, sql: any): Promise<number | null> {
 		// Check if this entity was already processed
 		const entityMap = this.processedEntities.get(tableName) || new Map();
 		if (entityMap.has(entity)) {
 			return entityMap.get(entity)!;
 		}
 		
-		const rowData = this.mapEntityToSchema(entity, schema, tableName);
-		if (Object.keys(rowData).length === 0) return null;
+		const rowData = this.extractEntityFields(entity, schema);
+		if (Object.keys(rowData).length === 0) {
+			return null;
+		}
+		
+		// Use sequential ID if no natural ID exists
+		if (!rowData.id) {
+			rowData.id = this.entityIdCounter++;
+		}
 		
 		const columns = Object.keys(rowData);
 		const placeholders = columns.map(() => '?').join(', ');
 		const values = Object.values(rowData);
 		
-		// Use INSERT OR IGNORE to handle potential duplicates
-		const insertSQL = `INSERT OR IGNORE INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
-		sql.exec(insertSQL, ...values);
+		// Use INSERT OR REPLACE to handle potential duplicates
+		const insertSQL = `INSERT OR REPLACE INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
 		
-		// Get the inserted or existing ID
-		let insertedId: number | null = null;
-		if (rowData.id) {
-			// If we have the ID in the data, use it
-			insertedId = typeof rowData.id === 'number' ? rowData.id : null;
+		try {
+			// Handle different SQL interfaces for execution
+			if (typeof sql.prepare === 'function') {
+				// better-sqlite3 interface
+				const stmt = sql.prepare(insertSQL);
+				stmt.run(...values);
+			} else {
+				// Cloudflare Workers SQL interface
+				sql.exec(insertSQL, ...values);
+			}
+			
+			// Get the inserted ID
+			const insertedId = rowData.id;
+			
+			// Track this entity
+			if (insertedId) {
+				entityMap.set(entity, insertedId);
+				this.processedEntities.set(tableName, entityMap);
+			}
+			
+			return insertedId;
+		} catch (error) {
+			console.error(`Error inserting entity into ${tableName}:`, error);
+			return null;
 		}
-		
-		if (!insertedId) {
-			// Otherwise get the last inserted row ID
-			const result = sql.exec(`SELECT last_insert_rowid() as id`).one();
-			insertedId = result?.id || null;
-		}
-		
-		// Track this entity
-		if (insertedId) {
-			entityMap.set(entity, insertedId);
-			this.processedEntities.set(tableName, entityMap);
-		}
-		
-		return insertedId;
 	}
-	
-	private async insertJunctionTableRecords(data: any, schemas: Record<string, TableSchema>, sql: any): Promise<void> {
-		// Only create junction table records for relationships that actually have data
-		for (const [relationshipKey, relationshipPairs] of this.relationshipData.entries()) {
-			if (schemas[relationshipKey]) {
-				const [table1, table2] = relationshipKey.split('_');
+
+	private async updateForeignKeyRelationships(obj: any, schemas: Record<string, TableSchema>, sql: any, path: string[] = []): Promise<void> {
+		if (!obj || typeof obj !== 'object') return;
+		
+		// Handle arrays
+		if (Array.isArray(obj)) {
+			for (const item of obj) {
+				await this.updateForeignKeyRelationships(item, schemas, sql, path);
+			}
+			return;
+		}
+		
+		// Handle GraphQL edges pattern
+		if (obj.edges && Array.isArray(obj.edges)) {
+			const nodes = obj.edges.map((edge: any) => edge.node).filter(Boolean);
+			for (const node of nodes) {
+				await this.updateForeignKeyRelationships(node, schemas, sql, path);
+			}
+			return;
+		}
+		
+		// If this object is an entity, update its foreign key relationships
+		if (this.isEntityOrCouldBeEntity(obj)) {
+			const entityType = this.inferEntityType(obj, path);
+			const entityInfo = this.entityToRowMap.get(obj);
+			
+			if (schemas[entityType] && entityInfo) {
+				await this.updateEntityForeignKeys(obj, entityInfo, schemas[entityType], sql);
+			}
+		}
+		
+		// Recursively process nested objects
+		for (const [key, value] of Object.entries(obj)) {
+			await this.updateForeignKeyRelationships(value, schemas, sql, [...path, key]);
+		}
+	}
+
+	private async updateEntityForeignKeys(entity: any, entityInfo: { tableName: string; id: number }, schema: TableSchema, sql: any): Promise<void> {
+		const updates: Array<{ column: string; value: number }> = [];
+		
+		// Find foreign key columns in the schema
+		for (const [columnName, columnType] of Object.entries(schema.columns)) {
+			if (columnName.endsWith('_id') && columnType.includes('REFERENCES') && !columnType.includes('PRIMARY KEY')) {
+				const baseKey = columnName.slice(0, -3); // Remove '_id' suffix
 				
-				for (const pairKey of relationshipPairs) {
-					const [id1, id2] = pairKey.split('_').map(Number);
-					
-					const insertSQL = `INSERT OR IGNORE INTO ${relationshipKey} (${table1}_id, ${table2}_id) VALUES (?, ?)`;
-					sql.exec(insertSQL, id1, id2);
+				// First try to find a direct nested entity
+				let foundEntity = null;
+				const originalKey = this.findOriginalKeyWithSemantics(entity, baseKey);
+				
+				if (originalKey && entity[originalKey]) {
+					const value = entity[originalKey];
+					if (value && typeof value === 'object' && this.isEntityOrCouldBeEntity(value)) {
+						foundEntity = value;
+					}
+				}
+				
+				// If no direct match, try finding nested entity
+				if (!foundEntity) {
+					foundEntity = this.findNestedEntityForForeignKey(entity, columnName, baseKey);
+				}
+				
+				// If still no match, check for semantic mappings
+				if (!foundEntity) {
+					foundEntity = this.findEntityBySemanticMapping(entity, baseKey);
+				}
+				
+				if (foundEntity) {
+					const referencedEntityInfo = this.entityToRowMap.get(foundEntity);
+					if (referencedEntityInfo) {
+						updates.push({ column: columnName, value: referencedEntityInfo.id });
+						console.log(`Found foreign key relationship: ${entityInfo.tableName}.${columnName} -> ${referencedEntityInfo.tableName}(${referencedEntityInfo.id})`);
+					}
 				}
 			}
 		}
-	}
-	
-	private getEntityId(entity: any, entityType: string): number | null {
-		const entityMap = this.processedEntities.get(entityType);
-		return entityMap?.get(entity) || null;
-	}
-	
-	private mapEntityToSchema(obj: any, schema: TableSchema, tableName: string): any {
-		const rowData: any = {};
 		
-		if (!obj || typeof obj !== 'object') {
-			if (schema.columns.value) rowData.value = obj;
-			return rowData;
+		// Apply the updates
+		for (const update of updates) {
+			const updateSQL = `UPDATE ${entityInfo.tableName} SET ${update.column} = ? WHERE id = ?`;
+			console.log(`Updating foreign key: ${updateSQL}`, [update.value, entityInfo.id]);
+			
+			try {
+				// Handle different SQL interfaces for execution
+				if (typeof sql.prepare === 'function') {
+					// better-sqlite3 interface
+					const stmt = sql.prepare(updateSQL);
+					stmt.run(update.value, entityInfo.id);
+				} else {
+					// Cloudflare Workers SQL interface
+					sql.exec(updateSQL, update.value, entityInfo.id);
+				}
+			} catch (error) {
+				console.error(`Error updating foreign key ${entityInfo.tableName}.${update.column}:`, error);
+			}
+		}
+	}
+
+	private findEntityBySemanticMapping(entity: any, baseKey: string): any {
+		// Check for common PDB field mappings
+		const semanticMappings: Record<string, string[]> = {
+			'entry_info': ['rcsb_entry_info', 'entryInfo', 'entry_information'],
+			'polymer_entity': ['rcsb_polymer_entity', 'polymerEntity', 'polymer_entities'],
+			'chem_comp': ['chem_comp', 'chemComp', 'chemical_component'],
+			'citation': ['citation', 'citations', 'reference'],
+			'assembly': ['assembly', 'assemblies', 'biological_assembly']
+		};
+		
+		const possibleKeys = semanticMappings[baseKey] || [baseKey];
+		
+		for (const possibleKey of possibleKeys) {
+			const originalKey = this.findOriginalKeyWithSemantics(entity, possibleKey);
+			if (originalKey && entity[originalKey]) {
+				const value = entity[originalKey];
+				if (value && typeof value === 'object' && this.isEntityOrCouldBeEntity(value)) {
+					return value;
+				}
+			}
 		}
 		
-		for (const columnName of Object.keys(schema.columns)) {
-			if (columnName === 'id' && schema.columns[columnName].includes('AUTOINCREMENT')) {
+		return null;
+	}
+
+	private findNestedEntityForForeignKey(entity: any, foreignKeyColumn: string, baseKey: string): any {
+		// Look for nested entities that could be referenced by this foreign key
+		for (const [key, value] of Object.entries(entity)) {
+			if (value && typeof value === 'object' && !Array.isArray(value)) {
+				// Check if this nested object could be the referenced entity
+				const semanticKey = this.getSemanticColumnName(key);
+				if (semanticKey === baseKey || key === baseKey || this.sanitizeColumnName(key) === baseKey) {
+					if (this.isEntityOrCouldBeEntity(value)) {
+						return value;
+					}
+				}
+			}
+		}
+		return null;
+	}
+
+	private extractEntityFields(entity: any, schema: TableSchema): any {
+		const rowData: any = {};
+		
+		if (!entity || typeof entity !== 'object') {
+			return { value: entity };
+		}
+		
+		for (const [columnName, columnType] of Object.entries(schema.columns)) {
+			if (columnName === 'id') continue; // Skip auto-generated ID
+			
+			// Handle foreign key columns
+			if (columnName.endsWith('_id') && columnType.includes('REFERENCES')) {
+				// Foreign keys will be populated later in updateEntityForeignKeys
+				rowData[columnName] = null;
 				continue;
 			}
 			
-			let value = null;
+			// Find the corresponding field in the entity
+			const value = this.findValueForColumn(entity, columnName);
 			
-			// Handle foreign key columns with enhanced matching
-			if (columnName.endsWith('_id') && !columnName.includes('_json')) {
-				const baseKey = columnName.slice(0, -3);
-				const originalKey = this.findOriginalKeyWithSemantics(obj, baseKey);
-				if (originalKey && obj[originalKey] && typeof obj[originalKey] === 'object') {
-					const referencedEntity = obj[originalKey];
-					value = referencedEntity.id || referencedEntity.rcsb_id || null;
+			if (value !== undefined) {
+				// Convert boolean to integer for SQLite
+				if (typeof value === 'boolean') {
+					rowData[columnName] = value ? 1 : 0;
+				} else if (value === null) {
+					rowData[columnName] = null;
+				} else if (typeof value === 'object') {
+					// Store complex objects as JSON
+					rowData[columnName] = JSON.stringify(value);
+				} else {
+					rowData[columnName] = value;
 				}
-			}
-			// Handle prefixed columns (from nested scalar fields) with semantic awareness
-			else if (columnName.includes('_') && !columnName.endsWith('_json')) {
-				const parts = columnName.split('_');
-				if (parts.length >= 2) {
-					const baseKey = parts[0];
-					const subKey = parts.slice(1).join('_');
-					const originalKey = this.findOriginalKeyWithSemantics(obj, baseKey);
-					if (originalKey && obj[originalKey] && typeof obj[originalKey] === 'object') {
-						const nestedObj = obj[originalKey];
-						const originalSubKey = this.findOriginalKeyWithSemantics(nestedObj, subKey);
-						if (originalSubKey && nestedObj[originalSubKey] !== undefined) {
-							value = nestedObj[originalSubKey];
-							if (typeof value === 'boolean') value = value ? 1 : 0;
-						}
-					}
-				}
-			}
-			// Handle JSON columns
-			else if (columnName.endsWith('_json')) {
-				const baseKey = columnName.slice(0, -5);
-				const originalKey = this.findOriginalKeyWithSemantics(obj, baseKey);
-				if (originalKey && obj[originalKey] && typeof obj[originalKey] === 'object') {
-					value = JSON.stringify(obj[originalKey]);
-				}
-			}
-			// Handle regular columns with semantic mapping
-			else {
-				const originalKey = this.findOriginalKeyWithSemantics(obj, columnName);
-				if (originalKey && obj[originalKey] !== undefined) {
-					value = obj[originalKey];
-					if (typeof value === 'boolean') value = value ? 1 : 0;
-					
-					// Skip arrays of entities (they're handled via junction tables)
-					if (Array.isArray(value) && value.length > 0 && this.isEntityOrCouldBeEntity(value[0])) {
-						continue;
-					}
-					
-					// Store primitive arrays as JSON
-					if (Array.isArray(value)) {
-						value = JSON.stringify(value);
-					}
-				}
-			}
-			
-			// CRITICAL: Type coercion to match schema expectations
-			if (value !== null && value !== undefined) {
-				const expectedType = schema.columns[columnName].toUpperCase();
-				const coercedValue = this.coerceValueToSchemaType(value, expectedType, columnName);
-				if (coercedValue !== null) {
-					rowData[columnName] = coercedValue;
-				}
+			} else {
+				rowData[columnName] = null;
 			}
 		}
 		
 		return rowData;
 	}
 	
+	private findValueForColumn(entity: any, columnName: string): any {
+		// Direct field match
+		if (entity.hasOwnProperty(columnName)) {
+			return entity[columnName];
+		}
+		
+		// Try semantic mapping reverse lookup
+		const originalKey = this.findOriginalKeyWithSemantics(entity, columnName);
+		if (originalKey && entity.hasOwnProperty(originalKey)) {
+			return entity[originalKey];
+		}
+		
+		// Handle nested field extraction (e.g., entity_poly_type from entity_poly.type)
+		if (columnName.includes('_')) {
+			const parts = columnName.split('_');
+			
+			// Try to find the nested path by reconstructing from semantic mappings
+			for (let splitPoint = 1; splitPoint < parts.length; splitPoint++) {
+				const parentPath = parts.slice(0, splitPoint).join('_');
+				const childPath = parts.slice(splitPoint).join('_');
+				
+				// Find the parent object
+				const parentKey = this.findOriginalKeyWithSemantics(entity, parentPath);
+				if (parentKey && entity[parentKey] && typeof entity[parentKey] === 'object' && !Array.isArray(entity[parentKey])) {
+					const parentObj = entity[parentKey];
+					
+					// Find the child field in the parent object
+					const childKey = this.findOriginalKeyWithSemantics(parentObj, childPath);
+					if (childKey && parentObj.hasOwnProperty(childKey)) {
+						return parentObj[childKey];
+					}
+					
+					// Try direct child field access
+					if (parentObj.hasOwnProperty(childPath)) {
+						return parentObj[childPath];
+					}
+				}
+			}
+			
+			// Fallback: traverse the nested structure step by step
+			let current = entity;
+			for (let i = 0; i < parts.length && current; i++) {
+				const part = parts[i];
+				
+				// Try exact match first
+				if (current.hasOwnProperty(part)) {
+					current = current[part];
+					continue;
+				}
+				
+				// Try semantic mapping
+				const semanticKey = this.findOriginalKeyWithSemantics(current, part);
+				if (semanticKey && current.hasOwnProperty(semanticKey)) {
+					current = current[semanticKey];
+					continue;
+				}
+				
+				// If we can't find this part, return undefined
+				return undefined;
+			}
+			
+			// Return the final value only if it's a scalar
+			if (current !== null && typeof current !== 'object') {
+				return current;
+			}
+		}
+		
+		return undefined;
+	}
+
+	private async insertJunctionTableRecords(data: any, schemas: Record<string, TableSchema>, sql: any): Promise<void> {
+		// Find many-to-many relationships and create junction table records
+		await this.discoverAndInsertManyToManyRelationships(data, schemas, sql);
+	}
+
+	private async discoverAndInsertManyToManyRelationships(obj: any, schemas: Record<string, TableSchema>, sql: any, path: string[] = []): Promise<void> {
+		if (!obj || typeof obj !== 'object') return;
+		
+		// Handle arrays
+		if (Array.isArray(obj)) {
+			for (const item of obj) {
+				await this.discoverAndInsertManyToManyRelationships(item, schemas, sql, path);
+			}
+			return;
+		}
+		
+		// If this is an entity, check for array relationships
+		if (this.isEntityOrCouldBeEntity(obj)) {
+			const entityInfo = this.entityToRowMap.get(obj);
+			if (entityInfo) {
+				for (const [key, value] of Object.entries(obj)) {
+					if (Array.isArray(value) && value.length > 0) {
+						// Check if array contains entities
+						const entityItems = value.filter(item => this.isEntityOrCouldBeEntity(item));
+						if (entityItems.length > 0) {
+							const firstItem = entityItems[0];
+							const relatedEntityType = this.inferEntityType(firstItem, [key]);
+							const junctionTableName = this.getJunctionTableName(entityInfo.tableName, relatedEntityType);
+							
+							if (schemas[junctionTableName]) {
+								// Insert relationships for all entities in this array
+								for (const relatedEntity of entityItems) {
+									const relatedEntityInfo = this.entityToRowMap.get(relatedEntity);
+									if (relatedEntityInfo) {
+										const insertSQL = `INSERT OR IGNORE INTO ${junctionTableName} (${entityInfo.tableName}_id, ${relatedEntityInfo.tableName}_id) VALUES (?, ?)`;
+										console.log(`Creating junction table relationship: ${insertSQL}`, [entityInfo.id, relatedEntityInfo.id]);
+										try {
+											sql.exec(insertSQL, entityInfo.id, relatedEntityInfo.id);
+										} catch (error) {
+											console.error(`Error creating junction relationship in ${junctionTableName}:`, error);
+										}
+									}
+								}
+							}
+						}
+					} else if (value && typeof value === 'object' && this.isEntityOrCouldBeEntity(value)) {
+						// Handle one-to-one relationships that might need junction tables
+						const relatedEntityInfo = this.entityToRowMap.get(value);
+						if (relatedEntityInfo && relatedEntityInfo.tableName !== entityInfo.tableName) {
+							const junctionTableName = this.getJunctionTableName(entityInfo.tableName, relatedEntityInfo.tableName);
+							if (schemas[junctionTableName]) {
+								const insertSQL = `INSERT OR IGNORE INTO ${junctionTableName} (${entityInfo.tableName}_id, ${relatedEntityInfo.tableName}_id) VALUES (?, ?)`;
+								console.log(`Creating junction table relationship (1:1): ${insertSQL}`, [entityInfo.id, relatedEntityInfo.id]);
+								try {
+									sql.exec(insertSQL, entityInfo.id, relatedEntityInfo.id);
+								} catch (error) {
+									console.error(`Error creating junction relationship (1:1) in ${junctionTableName}:`, error);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		// Recursively process nested objects
+		for (const [key, value] of Object.entries(obj)) {
+			await this.discoverAndInsertManyToManyRelationships(value, schemas, sql, [...path, key]);
+		}
+	}
+
+	private getJunctionTableName(table1: string, table2: string): string {
+		// Use the same logic as SchemaInferenceEngine for consistency
+		return [table1, table2].sort().join('_');
+	}
+
 	/**
 	 * Coerces a value to match the expected SQLite column type to prevent SQLITE_MISMATCH errors
 	 */
@@ -426,70 +631,74 @@ export class DataInsertionEngine {
 				const value = obj[key];
 				return value !== null && typeof value !== 'object';
 			});
-			return hasNonObjectFields;
+			if (hasNonObjectFields) return true;
 		}
 		
 		return false;
 	}
 	
 	private inferEntityType(obj: any, path: string[]): string {
-		// Enhanced inference matching SchemaInferenceEngine
-		if (obj.__typename) return this.sanitizeTableName(obj.__typename);
-		if (obj.type && typeof obj.type === 'string' && !this.isGraphQLWrapperField(obj.type)) {
-			return this.sanitizeTableName(obj.type);
+		// Try to infer from object keys first
+		const keys = Object.keys(obj);
+		
+		// Look for type indicators in the object itself
+		if (keys.includes('__typename')) {
+			return this.sanitizeTableName(this.singularize(obj.__typename));
 		}
 		
+		// Use path context
 		if (path.length > 0) {
-			let lastName = path[path.length - 1];
-
-			// Handle GraphQL patterns
-			if (lastName === 'node' && path.length > 1) {
-				lastName = path[path.length - 2];
-				if (lastName === 'edges' && path.length > 2) {
-					lastName = path[path.length - 3];
-				}
-			} else if (lastName === 'edges' && path.length > 1) {
-				lastName = path[path.length - 2];
+			const lastName = path[path.length - 1];
+			// Skip GraphQL wrapper fields
+			if (!this.isGraphQLWrapperField(lastName)) {
+				return this.sanitizeTableName(this.singularize(lastName));
 			}
 			
-			return this.sanitizeTableName(this.singularize(lastName));
+			// If last name is wrapper, try previous
+			if (path.length > 1) {
+				const prevName = path[path.length - 2];
+				if (!this.isGraphQLWrapperField(prevName)) {
+					return this.sanitizeTableName(this.singularize(prevName));
+				}
+			}
 		}
 		
-		// Infer from object structure
-		if (obj.rcsb_id) {
-			if (obj.chem_comp || obj.formula) return 'chemical_compound';
-			if (obj.struct || obj.title) return 'entry';
-			if (obj.sequence) return 'polymer_entity';
+		// Look for entity indicator fields
+		const entityIndicators = ['name', 'title', 'id', 'type', 'description'];
+		for (const indicator of entityIndicators) {
+			if (keys.includes(indicator)) {
+				return this.sanitizeTableName(indicator + '_entity');
+			}
 		}
 		
-		return 'entity_' + Math.random().toString(36).substr(2, 9);
+		// Fallback
+		return this.sanitizeTableName('entity_' + Math.random().toString(36).substr(2, 6));
 	}
 	
 	private isGraphQLWrapperField(fieldName: string): boolean {
-		return ['nodes', 'edges', 'node', 'data', 'items', 'results'].includes(fieldName.toLowerCase());
+		return ['edges', 'node', 'nodes', 'data', 'items', 'results', 'list'].includes(fieldName.toLowerCase());
 	}
 	
 	private singularize(word: string): string {
-		const sanitized = this.sanitizeTableName(word);
+		if (!word || typeof word !== 'string') return word;
 		
-		// Common English pluralization patterns (same as SchemaInferenceEngine)
-		if (sanitized.endsWith('ies') && sanitized.length > 4) {
-			return sanitized.slice(0, -3) + 'y';
-		}
-		if (sanitized.endsWith('ves') && sanitized.length > 4) {
-			return sanitized.slice(0, -3) + 'f';
-		}
-		if (sanitized.endsWith('ses') && sanitized.length > 4) {
-			return sanitized.slice(0, -2);
-		}
-		if (sanitized.endsWith('s') && !sanitized.endsWith('ss') && sanitized.length > 2) {
-			const exceptions = ['genus', 'species', 'series', 'analysis', 'basis', 'axis'];
-			if (!exceptions.includes(sanitized)) {
-				return sanitized.slice(0, -1);
+		const singularRules: Array<[RegExp, string]> = [
+			[/ies$/i, 'y'],
+			[/([^aeiou])ies$/i, '$1y'],
+			[/ves$/i, 'f'],
+			[/([lr])ves$/i, '$1f'],
+			[/([^f])ves$/i, '$1fe'],
+			[/([^aeiouy]|qu)ies$/i, '$1y'],
+			[/s$/i, ''],
+		];
+		
+		for (const [pattern, replacement] of singularRules) {
+			if (pattern.test(word)) {
+				return word.replace(pattern, replacement);
 			}
 		}
 		
-		return sanitized;
+		return word;
 	}
 	
 	private sanitizeTableName(name: string): string {
@@ -520,179 +729,139 @@ export class DataInsertionEngine {
 	}
 	
 	private findOriginalKeyWithSemantics(obj: any, sanitizedKey: string): string | null {
+		if (!obj || typeof obj !== 'object') return null;
+		
 		const keys = Object.keys(obj);
 		
-		// Direct match first
-		if (keys.includes(sanitizedKey)) return sanitizedKey;
+		// First try exact match (case-insensitive)
+		let exactMatch = keys.find(k => k.toLowerCase() === sanitizedKey.toLowerCase());
+		if (exactMatch) return exactMatch;
 		
-		// Check semantic mappings - reverse lookup
-		for (const [originalKey, semanticKey] of this.semanticMappings.entries()) {
-			if (semanticKey === sanitizedKey && keys.some(k => k.toLowerCase() === originalKey)) {
-				return keys.find(k => k.toLowerCase() === originalKey) || null;
+		// Then try semantic mapping (reverse lookup)
+		const semanticKey = this.getSemanticColumnName(sanitizedKey);
+		if (semanticKey !== sanitizedKey) {
+			exactMatch = keys.find(k => k.toLowerCase() === semanticKey.toLowerCase());
+			if (exactMatch) return exactMatch;
+		}
+		
+		// Try finding original key through reverse mapping
+		for (const [original, mapped] of this.semanticMappings.entries()) {
+			if (mapped === sanitizedKey || mapped === semanticKey) {
+				exactMatch = keys.find(k => k.toLowerCase() === original);
+				if (exactMatch) return exactMatch;
 			}
 		}
 		
-		// Find key that sanitizes to the same value
-		const matchingKey = keys.find(key => 
-			this.sanitizeColumnName(this.getSemanticColumnName(key)) === sanitizedKey
-		);
-		
-		return matchingKey || null;
+		// Try partial matches and common variations
+		return this.findOriginalKey(obj, sanitizedKey);
 	}
 	
 	private getSemanticColumnName(originalName: string): string {
-		const lower = originalName.toLowerCase();
-		return this.semanticMappings.get(lower) || originalName;
+		return this.semanticMappings.get(originalName.toLowerCase()) || originalName;
 	}
 	
 	private findOriginalKey(obj: any, sanitizedKey: string): string | null {
-		// Fallback to original method for compatibility
-		return this.findOriginalKeyWithSemantics(obj, sanitizedKey);
+		if (!obj || typeof obj !== 'object') return null;
+		
+		const keys = Object.keys(obj);
+		const cleanSanitized = sanitizedKey.toLowerCase().replace(/_/g, '');
+		
+		// Try to find a key that matches when underscores and casing are ignored
+		for (const key of keys) {
+			const cleanKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+			if (cleanKey === cleanSanitized) {
+				return key;
+			}
+		}
+		
+		return null;
 	}
 	
 	private sanitizeColumnName(name: string): string {
 		if (!name || typeof name !== 'string') {
-			return 'column_' + Math.random().toString(36).substr(2, 9);
+			return 'col_' + Math.random().toString(36).substr(2, 9);
 		}
 		
-		// Convert camelCase to snake_case
-		let snakeCase = name
-			.replace(/([A-Z])/g, '_$1')
-			.toLowerCase()
+		let sanitized = name
 			.replace(/[^a-zA-Z0-9_]/g, '_')
 			.replace(/_{2,}/g, '_')
-			.replace(/^_|_$/g, '');
+			.replace(/^_|_$/g, '')
+			.toLowerCase();
 		
-		if (/^[0-9]/.test(snakeCase)) {
-			snakeCase = 'col_' + snakeCase;
+		if (/^[0-9]/.test(sanitized)) {
+			sanitized = 'col_' + sanitized;
 		}
 		
-		if (!snakeCase || snakeCase.length === 0) {
-			snakeCase = 'column_' + Math.random().toString(36).substr(2, 9);
+		if (!sanitized || sanitized.length === 0) {
+			sanitized = 'col_' + Math.random().toString(36).substr(2, 9);
 		}
 		
-		// Enhanced PDB terms mapping (matching SchemaInferenceEngine)
-		const pdbTerms: Record<string, string> = {
-			'entrezid': 'entrez_id',
-			'displayname': 'display_name',
-			'pdbid': 'pdb_id',
-			'chainid': 'chain_id',
-			'entityid': 'entity_id',
-			'assemblyid': 'assembly_id',
-			'molecularweight': 'molecular_weight',
-			'experimentalmethod': 'experimental_method',
-			'resolutionangstrom': 'resolution_angstrom',
-			'ncbitaxonomyid': 'taxonomy_id',
-			'ncbiscientificname': 'organism_name',
-			'pdbxseqonelettercode': 'sequence',
-			'pdbxseqonelettercodecan': 'amino_acid_sequence',
-			'rcsbid': 'id',
-			'rcsbentityid': 'entity_id',
-		};
+		const reservedWords = [
+			'abort', 'action', 'add', 'after', 'all', 'alter', 'analyze', 'and', 'as', 'asc',
+			'attach', 'autoincrement', 'before', 'begin', 'between', 'by', 'cascade', 'case',
+			'cast', 'check', 'collate', 'column', 'commit', 'conflict', 'constraint', 'create',
+			'cross', 'current_date', 'current_time', 'current_timestamp', 'database', 'default',
+			'deferrable', 'deferred', 'delete', 'desc', 'detach', 'distinct', 'drop', 'each',
+			'else', 'end', 'escape', 'except', 'exclusive', 'exists', 'explain', 'fail', 'for',
+			'foreign', 'from', 'full', 'glob', 'group', 'having', 'if', 'ignore', 'immediate',
+			'in', 'index', 'indexed', 'initially', 'inner', 'insert', 'instead', 'intersect',
+			'into', 'is', 'isnull', 'join', 'key', 'left', 'like', 'limit', 'match', 'natural',
+			'no', 'not', 'notnull', 'null', 'of', 'offset', 'on', 'or', 'order', 'outer', 'plan',
+			'pragma', 'primary', 'query', 'raise', 'recursive', 'references', 'regexp', 'reindex',
+			'release', 'rename', 'replace', 'restrict', 'right', 'rollback', 'row', 'savepoint',
+			'select', 'set', 'table', 'temp', 'temporary', 'then', 'to', 'transaction', 'trigger',
+			'union', 'unique', 'update', 'using', 'vacuum', 'values', 'view', 'virtual', 'when',
+			'where', 'with', 'without'
+		];
 		
-		const result = pdbTerms[snakeCase] || snakeCase;
-		
-		const reservedWords = ['table', 'index', 'view', 'column', 'primary', 'key', 'foreign', 'constraint', 'order', 'group', 'select', 'from', 'where'];
-		if (reservedWords.includes(result)) {
-			return result + '_col';
+		if (reservedWords.includes(sanitized)) {
+			sanitized = sanitized + '_col';
 		}
 		
-		return result;
+		return sanitized;
 	}
-
+	
 	private async insertSimpleRow(obj: any, tableName: string, schema: TableSchema, sql: any): Promise<void> {
 		const rowData = this.mapObjectToSimpleSchema(obj, schema, tableName);
-		if (Object.keys(rowData).length === 0 && !(tableName === 'data_scalar' && obj === null)) return;
-
+		if (Object.keys(rowData).length === 0) return;
+		
 		const columns = Object.keys(rowData);
 		const placeholders = columns.map(() => '?').join(', ');
 		const values = Object.values(rowData);
-
-		const insertSQL = `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
+		
+		const insertSQL = `INSERT OR IGNORE INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
 		sql.exec(insertSQL, ...values);
 	}
-
+	
 	private mapObjectToSimpleSchema(obj: any, schema: TableSchema, tableName: string): any {
 		const rowData: any = {};
-
-		if (obj === null || typeof obj !== 'object') {
-			if (schema.columns.value) {
-				const expectedType = schema.columns.value.toUpperCase();
-				const coercedValue = this.coerceValueToSchemaType(obj, expectedType, 'value');
-				if (coercedValue !== null) {
-					rowData.value = coercedValue;
-				}
-			} else if (Object.keys(schema.columns).length > 0) {
-				const firstCol = Object.keys(schema.columns)[0];
-				const expectedType = schema.columns[firstCol].toUpperCase();
-				const coercedValue = this.coerceValueToSchemaType(obj, expectedType, firstCol);
-				if (coercedValue !== null) {
-					rowData[firstCol] = coercedValue;
-				}
-			}
-			return rowData;
-		}
-
-		if (Array.isArray(obj)) {
-			// Handle array data with enhanced semantics
-			const jsonKey = Object.keys(schema.columns).find(key => key.endsWith('_json')) || 'array_data_json';
-			if (schema.columns[jsonKey]) {
-				const expectedType = schema.columns[jsonKey].toUpperCase();
-				const coercedValue = this.coerceValueToSchemaType(JSON.stringify(obj), expectedType, jsonKey);
-				if (coercedValue !== null) {
-					rowData[jsonKey] = coercedValue;
-				}
-			}
-			return rowData;
-		}
-
+		
 		for (const columnName of Object.keys(schema.columns)) {
-			let valueToInsert = undefined;
-			let originalKeyFound = false;
-
-			if (columnName.endsWith('_json')) {
-				const baseKey = columnName.slice(0, -5);
-				const originalKey = this.findOriginalKeyWithSemantics(obj, baseKey);
-				if (originalKey && obj[originalKey] !== undefined) {
-					valueToInsert = JSON.stringify(obj[originalKey]);
-					originalKeyFound = true;
-				}
-			} else {
+			if (columnName === 'id' && schema.columns[columnName].includes('AUTOINCREMENT')) {
+				continue;
+			}
+			
+			let value = null;
+			if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
 				const originalKey = this.findOriginalKeyWithSemantics(obj, columnName);
 				if (originalKey && obj[originalKey] !== undefined) {
-					const val = obj[originalKey];
-					if (typeof val === 'boolean') {
-						valueToInsert = val ? 1 : 0;
-					} else if (typeof val === 'object' && val !== null) {
-						valueToInsert = JSON.stringify(val);
-					} else {
-						valueToInsert = val;
-					}
-					originalKeyFound = true;
+					value = obj[originalKey];
+					if (typeof value === 'boolean') value = value ? 1 : 0;
+					if (typeof value === 'object') value = JSON.stringify(value);
 				}
+			} else if (columnName === 'value') {
+				value = obj;
 			}
-
-			if (originalKeyFound && valueToInsert !== undefined) {
-				// Apply type coercion to prevent SQLITE_MISMATCH
+			
+			if (value !== null && value !== undefined) {
 				const expectedType = schema.columns[columnName].toUpperCase();
-				const coercedValue = this.coerceValueToSchemaType(valueToInsert, expectedType, columnName);
-				if (coercedValue !== null) {
-					rowData[columnName] = coercedValue;
-				}
-			} else if (obj.hasOwnProperty(columnName) && obj[columnName] !== undefined){
-				const val = obj[columnName];
-				let processedVal = val;
-				if (typeof val === 'boolean') processedVal = val ? 1:0;
-				else if (typeof val === 'object' && val !== null) processedVal = JSON.stringify(val);
-				
-				// Apply type coercion
-				const expectedType = schema.columns[columnName].toUpperCase();
-				const coercedValue = this.coerceValueToSchemaType(processedVal, expectedType, columnName);
+				const coercedValue = this.coerceValueToSchemaType(value, expectedType, columnName);
 				if (coercedValue !== null) {
 					rowData[columnName] = coercedValue;
 				}
 			}
 		}
+		
 		return rowData;
 	}
 } 
