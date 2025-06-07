@@ -1,14 +1,16 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { JsonToSqlDO } from "./do.js";
+import { ProcessingResult } from "./lib/types.js";
 
-// Define our RCSB PDB MCP agent
-export class RcsbPdbMCP extends McpAgent {
-	server = new McpServer({
-		name: "RcsbPdbExplorer",
-		version: "0.1.0",
-		description:
-			`MCP Server for querying the RCSB Protein Data Bank (PDB) GraphQL API.
+// ========================================
+// API CONFIGURATION - RCSB PDB Specific
+// ========================================
+const API_CONFIG = {
+	name: "RcsbPdbExplorer",
+	version: "0.1.0",
+	description: `MCP Server for querying the RCSB Protein Data Bank (PDB) GraphQL API, processes responses into SQLite tables, and returns metadata for subsequent SQL querying.
 
 Before running any specific data queries, it is **strongly recommended** to use GraphQL introspection queries to explore and understand the schema of the RCSB PDB API. Introspection allows you to:
 
@@ -18,37 +20,20 @@ Before running any specific data queries, it is **strongly recommended** to use 
 - **Craft more efficient and precise queries** by understanding which fields are available and how they are nested, reducing unnecessary trial and error.
 - **Accelerate development and debugging**: Introspection provides a live, up-to-date contract for the API, making it easier to troubleshoot and optimize your queries.
 
-**Example introspection query:**
-\`\`\`
-{
-  __schema {
-    queryType { name }
-    types { name kind description fields { name type { name kind } } }
-  }
-}
-\`\`\`
-Use introspection to map out the schema, then construct targeted queries for entries, polymer entities, assemblies, chemical components, and more.
-
-Refer to the RCSB PDB Data API documentation and the GraphiQL tool (available at the API endpoint) for further schema exploration and query examples. If a query fails, always consider using introspection to verify field names and types before retrying.`,
-
-		// MCP Spec: "servers that emit log message notifications MUST declare the `logging` capability"
-		// By default, McpServer might enable logging capability. If explicit:
-		capabilities: {
-			tools: {}, // Indicates tool support
-			// logging: {}, // Enable if server sends log notifications via MCP
-		}
-	});
-
-	// RCSB PDB API Configuration
-	private readonly RCSB_PDB_GRAPHQL_ENDPOINT = "https://data.rcsb.org/graphql";
-
-	async init() {
-		console.error("RCSB PDB MCP Server initialized.");
-
-		// Register the GraphQL execution tool
-		this.server.tool(
-			"rcsb_pdb_graphql_query",
-			`Executes a GraphQL query against the RCSB PDB Data API (https://data.rcsb.org/graphql).
+For large responses, the system automatically stages data into SQLite tables for advanced SQL analysis capabilities.`,
+	
+	// RCSB PDB GraphQL API settings
+	endpoint: 'https://data.rcsb.org/graphql',
+	headers: {
+		"Accept": 'application/json',
+		"User-Agent": "RcsbPdbMCP/0.1.0 (ModelContextProtocol; +https://modelcontextprotocol.io)"
+	},
+	
+	// Tool names and descriptions
+	tools: {
+		graphql: {
+			name: "rcsb_pdb_graphql_query",
+			description: `Executes a GraphQL query against the RCSB PDB Data API (https://data.rcsb.org/graphql), processes responses into SQLite tables, and returns metadata for subsequent SQL querying.
 
 **Tip:** For best results, start by using GraphQL introspection queries to explore the schema before running other queries. Introspection helps you discover all available types, fields, and relationships, prevents errors, and ensures your queries are accurate and up-to-date.
 
@@ -73,53 +58,112 @@ After exploring the schema, you can query for specific entries, polymer entities
 - Taxonomy for polymer entities (e.g., 4HHB_1 where 1 is entity_id):
   \`{ polymer_entity(entry_id: "4HHB", entity_id:"1") { rcsb_entity_source_organism { ncbi_scientific_name } } }\`
 
-Refer to the RCSB PDB Data API documentation and GraphiQL tool (at the API endpoint) for more examples and schema details. If a query fails, use introspection to verify field names and types.`,
+Returns a data_access_id and schema information for use with the SQL querying tool.`
+		},
+		sql: {
+			name: "rcsb_pdb_query_sql", 
+			description: "Execute read-only SQL queries against staged RCSB PDB data. Use the data_access_id from rcsb_pdb_graphql_query to query the SQLite tables. Supports analytical queries, CTEs, temporary tables, and JSON functions for analyzing protein structure data."
+		}
+	}
+};
+
+// In-memory registry of staged datasets
+const datasetRegistry = new Map<string, { created: string; table_count?: number; total_rows?: number }>();
+
+// ========================================
+// ENVIRONMENT INTERFACE
+// ========================================
+interface RcsbPdbEnv {
+	MCP_HOST?: string;
+	MCP_PORT?: string;
+	MCP_OBJECT: DurableObjectNamespace;
+	JSON_TO_SQL_DO: DurableObjectNamespace;
+}
+
+// ========================================
+// CORE MCP SERVER CLASS - RCSB PDB Specific
+// ========================================
+
+export class RcsbPdbMCP extends McpAgent {
+	server = new McpServer({
+		name: API_CONFIG.name,
+		version: API_CONFIG.version,
+		description: API_CONFIG.description,
+		capabilities: {
+			tools: {}, // Indicates tool support
+		}
+	});
+
+	async init() {
+		console.error("RCSB PDB MCP Server initialized.");
+
+		// Tool #1: GraphQL to SQLite staging
+		this.server.tool(
+			API_CONFIG.tools.graphql.name,
+			API_CONFIG.tools.graphql.description,
 			{
-				query: z.string().describe(
-					`The GraphQL query string to execute against the RCSB PDB GraphQL API.
+				query: z.string().describe(`The GraphQL query string to execute against the RCSB PDB GraphQL API.
 
 **Pro tip:** Use introspection queries like '{ __schema { types { name kind fields { name } } } }' to discover the schema before running other queries. This helps you avoid errors and ensures your queries are valid.
 
-Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method } } }'.`
-				),
-				variables: z
-					.record(z.any())
-					.optional()
-					.describe(
-						"Optional dictionary of variables for the GraphQL query. Example: { \"id\": \"4HHB\" }"
-					),
+Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method } } }'.`),
+				variables: z.record(z.any()).optional().describe("Optional dictionary of variables for the GraphQL query. Example: { \"entry_id\": \"4HHB\" }"),
 			},
-			async ({ query, variables }: { query: string; variables?: Record<string, any> }) => {
-				console.error(`Executing rcsb_pdb_graphql_query with query: ${query.slice(0, 150)}...`);
-				if (variables) {
-					console.error(`With variables: ${JSON.stringify(variables).slice(0, 100)}...`);
+                        async ({ query, variables }) => {
+                                try {
+                                        const graphqlResult = await this.executeRcsbPdbGraphQLQuery(query, variables);
+
+                                        if (this.shouldBypassStaging(graphqlResult, query)) {
+                                                return {
+                                                        content: [{
+                                                                type: "text" as const,
+                                                                text: JSON.stringify(graphqlResult, null, 2)
+                                                        }]
+                                                };
+                                        }
+
+                                        const stagingResult = await this.stageDataInDurableObject(graphqlResult);
+                                        return {
+                                                content: [{
+                                                        type: "text" as const,
+                                                        text: JSON.stringify(stagingResult, null, 2)
+                                                }]
+                                        };
+
+                                } catch (error) {
+                                        return this.createErrorResponse("GraphQL execution failed", error);
+                                }
+                        }
+                );
+
+		// Tool #2: SQL querying against staged data
+		this.server.tool(
+			API_CONFIG.tools.sql.name,
+			API_CONFIG.tools.sql.description,
+			{
+				data_access_id: z.string().describe("Data access ID from the GraphQL query tool"),
+				sql: z.string().describe("SQL SELECT query to execute against the staged PDB data"),
+				params: z.array(z.string()).optional().describe("Optional query parameters"),
+			},
+			async ({ data_access_id, sql }) => {
+				try {
+					const queryResult = await this.executeSQLQuery(data_access_id, sql);
+					return { content: [{ type: "text" as const, text: JSON.stringify(queryResult, null, 2) }] };
+				} catch (error) {
+					return this.createErrorResponse("SQL execution failed", error);
 				}
-
-				const result = await this.executeRcsbPdbGraphQLQuery(query, variables);
-
-				return {
-					content: [
-						{
-							type: "text",
-							// Pretty print JSON for easier reading by humans, and parsable by LLMs.
-							text: JSON.stringify(result, null, 2),
-						},
-					],
-				};
 			}
 		);
 	}
 
-	// Helper function to execute RCSB PDB GraphQL queries
-	private async executeRcsbPdbGraphQLQuery(
-		query: string,
-		variables?: Record<string, any>
-	): Promise<any> {
+	// ========================================
+	// RCSB PDB GRAPHQL CLIENT - Reused from original
+	// ========================================
+        private async executeRcsbPdbGraphQLQuery(query: string, variables?: Record<string, any>): Promise<any> {
 		try {
 			const headers = {
 				"Content-Type": "application/json",
-				"Accept": "application/json", // Ensure we ask for JSON
-				"User-Agent": "RcsbPdbMCP/0.1.0 (ModelContextProtocol; +https://modelcontextprotocol.io)",
+				...API_CONFIG.headers
 			};
 
 			const bodyData: Record<string, any> = { query };
@@ -127,10 +171,9 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 				bodyData.variables = variables;
 			}
 
-			console.error(`Making GraphQL request to: ${this.RCSB_PDB_GRAPHQL_ENDPOINT}`);
-			// console.error(`Request body: ${JSON.stringify(bodyData)}`); // Can be very verbose
+			console.error(`Making GraphQL request to: ${API_CONFIG.endpoint}`);
 
-			const response = await fetch(this.RCSB_PDB_GRAPHQL_ENDPOINT, {
+			const response = await fetch(API_CONFIG.endpoint, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(bodyData),
@@ -140,7 +183,6 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 
 			// RCSB PDB GraphQL API always returns 200 OK, with errors in the JSON body.
 			if (!response.ok) {
-				// This case might not be hit often if API strictly follows "always 200 OK"
 				let errorText = `RCSB PDB API HTTP Error ${response.status}`;
 				try {
 					const errorBody = await response.text();
@@ -205,49 +247,306 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 				],
 			};
 		}
+        }
+
+        private isIntrospectionQuery(query: string): boolean {
+                if (!query) return false;
+                
+                // Remove comments and normalize whitespace for analysis
+                const normalizedQuery = query
+                        .replace(/\s*#.*$/gm, '') // Remove comments
+                        .replace(/\s+/g, ' ')     // Normalize whitespace
+                        .trim()
+                        .toLowerCase();
+                
+                // Check for common introspection patterns
+                const introspectionPatterns = [
+                        '__schema',           // Schema introspection
+                        '__type',            // Type introspection
+                        '__typename',        // Typename introspection
+                        'introspectionquery', // Named introspection queries
+                        'getintrospectionquery'
+                ];
+                
+                return introspectionPatterns.some(pattern => 
+                        normalizedQuery.includes(pattern)
+                );
+        }
+
+        private shouldBypassStaging(result: any, originalQuery?: string): boolean {
+                if (!result) return true;
+
+                // Bypass if this was an introspection query
+                if (originalQuery && this.isIntrospectionQuery(originalQuery)) {
+                        return true;
+                }
+
+                // Bypass if GraphQL reported errors
+                if (result.errors) {
+                        return true;
+                }
+
+                // Check if response contains introspection-like data structure
+                if (result.data) {
+                        // Common introspection response patterns
+                        if (result.data.__schema || result.data.__type) {
+                                return true;
+                        }
+                        
+                        // Check for schema metadata structures
+                        const hasSchemaMetadata = Object.values(result.data).some((value: any) => {
+                                if (value && typeof value === 'object') {
+                                        // Look for typical schema introspection fields
+                                        const keys = Object.keys(value);
+                                        const schemaFields = ['types', 'queryType', 'mutationType', 'subscriptionType', 'directives'];
+                                        const typeFields = ['name', 'kind', 'description', 'fields', 'interfaces', 'possibleTypes', 'enumValues', 'inputFields'];
+                                        
+                                        return schemaFields.some(field => keys.includes(field)) ||
+                                               typeFields.filter(field => keys.includes(field)).length >= 2;
+                                }
+                                return false;
+                        });
+                        
+                        if (hasSchemaMetadata) {
+                                return true;
+                        }
+                }
+
+                // Check if response has multiple entities or complex structure that would benefit from staging
+                if (result.data) {
+                        const dataSize = JSON.stringify(result.data).length;
+                        
+                        // Always stage if data is substantial (> 2KB)
+                        if (dataSize > 2000) {
+                                return false; // Don't bypass = trigger staging
+                        }
+                        
+                        // Check for arrays of entities that should be staged
+                        const hasMultipleEntities = this.detectMultipleEntities(result.data);
+                        if (hasMultipleEntities) {
+                                return false; // Don't bypass = trigger staging
+                        }
+                        
+                        // Check for complex nested structures
+                        const hasComplexNesting = this.detectComplexNesting(result.data);
+                        if (hasComplexNesting) {
+                                return false; // Don't bypass = trigger staging
+                        }
+                }
+
+                // Detect mostly empty data objects
+                if (result.data) {
+                        const values = Object.values(result.data);
+                        const hasContent = values.some((v) => {
+                                if (v === null || v === undefined) return false;
+                                if (Array.isArray(v)) return v.length > 0;
+                                if (typeof v === "object") return Object.keys(v).length > 0;
+                                return true;
+                        });
+                        if (!hasContent) return true;
+                }
+
+                return false; // Default to staging for most queries
+        }
+        
+        private detectMultipleEntities(data: any): boolean {
+                if (!data || typeof data !== 'object') return false;
+                
+                // Look for arrays of entities
+                for (const value of Object.values(data)) {
+                        if (Array.isArray(value) && value.length > 1) {
+                                // Check if array contains entity-like objects
+                                const firstItem = value[0];
+                                if (firstItem && typeof firstItem === 'object' && 
+                                    (firstItem.id || firstItem.rcsb_id || Object.keys(firstItem).length >= 3)) {
+                                        return true;
+                                }
+                        }
+                }
+                
+                return false;
+        }
+        
+        private detectComplexNesting(data: any, depth: number = 0): boolean {
+                if (!data || typeof data !== 'object' || depth > 3) return false;
+                
+                // Count nested objects and arrays
+                let complexityScore = 0;
+                
+                for (const value of Object.values(data)) {
+                        if (Array.isArray(value)) {
+                                complexityScore += value.length > 0 ? 2 : 1;
+                        } else if (value && typeof value === 'object') {
+                                complexityScore += 1;
+                                if (this.detectComplexNesting(value, depth + 1)) {
+                                        complexityScore += 2;
+                                }
+                        }
+                }
+                
+                return complexityScore >= 4; // Arbitrary threshold for complexity
+        }
+
+	// ========================================
+	// DURABLE OBJECT INTEGRATION - Use this.env directly
+	// ========================================
+	private async stageDataInDurableObject(graphqlResult: any): Promise<any> {
+		const env = this.env as RcsbPdbEnv;
+		if (!env?.JSON_TO_SQL_DO) {
+			throw new Error("JSON_TO_SQL_DO binding not available");
+		}
+		
+		const accessId = crypto.randomUUID();
+		const doId = env.JSON_TO_SQL_DO.idFromName(accessId);
+		const stub = env.JSON_TO_SQL_DO.get(doId);
+		
+		const response = await stub.fetch("http://do/process", {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ jsonData: graphqlResult })
+		});
+		
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`DO staging failed: ${errorText}`);
+		}
+		
+		const processingResult = await response.json() as ProcessingResult;
+		
+		// Register the dataset for tracking
+		datasetRegistry.set(accessId, {
+			created: new Date().toISOString(),
+			table_count: processingResult.table_count,
+			total_rows: processingResult.total_rows
+		});
+		
+		// Return the format expected by the test framework
+		return {
+			data_access_id: accessId,
+			processing_details: processingResult
+		};
+	}
+
+        private async executeSQLQuery(dataAccessId: string, sql: string): Promise<any> {
+		const env = this.env as RcsbPdbEnv;
+		if (!env?.JSON_TO_SQL_DO) {
+			throw new Error("JSON_TO_SQL_DO binding not available");
+		}
+		
+		const doId = env.JSON_TO_SQL_DO.idFromName(dataAccessId);
+		const stub = env.JSON_TO_SQL_DO.get(doId);
+		
+		const response = await stub.fetch("http://do/query", {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ sql })
+		});
+		
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`SQL execution failed: ${errorText}`);
+		}
+		
+                return await response.json();
+        }
+
+        private async deleteDataset(dataAccessId: string): Promise<boolean> {
+                const env = this.env as RcsbPdbEnv;
+                if (!env?.JSON_TO_SQL_DO) {
+                        throw new Error("JSON_TO_SQL_DO binding not available");
+                }
+
+                const doId = env.JSON_TO_SQL_DO.idFromName(dataAccessId);
+                const stub = env.JSON_TO_SQL_DO.get(doId);
+
+                const response = await stub.fetch("http://do/delete", { method: 'DELETE' });
+
+                return response.ok;
+        }
+
+	// ========================================
+	// ERROR HANDLING - Reusable
+	// ========================================
+	private createErrorResponse(message: string, error: unknown) {
+		return {
+			content: [{
+				type: "text" as const,
+				text: JSON.stringify({
+					success: false,
+					error: message,
+					details: error instanceof Error ? error.message : String(error)
+				}, null, 2)
+			}]
+		};
 	}
 }
 
-// Define the Env interface for environment variables, if any.
-// For this server, no specific environment variables are strictly needed for RCSB PDB API access.
+// ========================================
+// CLOUDFLARE WORKERS BOILERPLATE - Updated for RCSB PDB
+// ========================================
 interface Env {
 	MCP_HOST?: string;
 	MCP_PORT?: string;
+	MCP_OBJECT: DurableObjectNamespace;
+	JSON_TO_SQL_DO: DurableObjectNamespace;
 }
 
-// Dummy ExecutionContext for type compatibility, usually provided by the runtime environment.
 interface ExecutionContext {
 	waitUntil(promise: Promise<any>): void;
 	passThroughOnException(): void;
 }
 
-// Export the fetch handler, standard for environments like Cloudflare Workers or Deno Deploy.
 export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response {
-		const url = new URL(request.url);
+        async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+                const url = new URL(request.url);
 
-		// SSE transport is primary as requested
-		if (url.pathname === "/sse" || url.pathname.startsWith("/sse/")) {
-			// The `RcsbPdbMCP.serveSSE` static method (inherited or implemented in McpAgentBase)
-			// is expected to return an object with a `fetch` method.
-			// @ts-ignore
-			return RcsbPdbMCP.serveSSE("/sse").fetch(request, env, ctx);
-		}
+                if (url.pathname === "/sse" || url.pathname.startsWith("/sse/")) {
+                        // @ts-ignore - SSE transport handling
+                        return RcsbPdbMCP.serveSSE("/sse").fetch(request, env, ctx);
+                }
 
-		// Fallback for unhandled paths
-		console.error(
-			`RCSB PDB MCP Server. Requested path ${url.pathname} not found. Listening for SSE on /sse.`
-		);
+                if (url.pathname === "/datasets" && request.method === "GET") {
+                        const list = Array.from(datasetRegistry.entries()).map(([id, info]) => ({
+                                data_access_id: id,
+                                ...info
+                        }));
+                        return new Response(JSON.stringify({ datasets: list }, null, 2), {
+                                headers: { "Content-Type": "application/json" }
+                        });
+                }
 
-		return new Response(
-			`RCSB PDB MCP Server - Path not found.\nAvailable MCP paths:\n- /sse (for Server-Sent Events transport)`,
-			{
-				status: 404,
-				headers: { "Content-Type": "text/plain" },
-			}
-		);
-	},
+                if (url.pathname.startsWith("/datasets/") && request.method === "DELETE") {
+                        const id = url.pathname.split("/")[2];
+                        if (!id || !datasetRegistry.has(id)) {
+                                return new Response(JSON.stringify({ error: "Dataset not found" }), {
+                                        status: 404,
+                                        headers: { "Content-Type": "application/json" }
+                                });
+                        }
+
+                        const doId = env.JSON_TO_SQL_DO.idFromName(id);
+                        const stub = env.JSON_TO_SQL_DO.get(doId);
+                        const resp = await stub.fetch("http://do/delete", { method: "DELETE" });
+                        if (resp.ok) {
+                                datasetRegistry.delete(id);
+                                return new Response(JSON.stringify({ success: true }), {
+                                        headers: { "Content-Type": "application/json" }
+                                });
+                        }
+
+                        const text = await resp.text();
+                        return new Response(JSON.stringify({ success: false, error: text }), {
+                                status: 500,
+                                headers: { "Content-Type": "application/json" }
+                        });
+                }
+
+                return new Response(
+                        `${API_CONFIG.name} - Available on /sse endpoint\nRCSB PDB GraphQL API with SQLite staging for complex data analysis`,
+                        { status: 404, headers: { "Content-Type": "text/plain" } }
+                );
+        },
 };
 
-// Export the Agent class if it needs to be used by other modules or for testing.
 export { RcsbPdbMCP as MyMCP };
+export { JsonToSqlDO };
