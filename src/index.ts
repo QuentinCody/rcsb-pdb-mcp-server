@@ -63,6 +63,10 @@ Returns a data_access_id and schema information for use with the SQL querying to
 		sql: {
 			name: "rcsb_pdb_query_sql", 
 			description: "Execute read-only SQL queries against staged RCSB PDB data. Use the data_access_id from rcsb_pdb_graphql_query to query the SQLite tables. Supports analytical queries, CTEs, temporary tables, and JSON functions for analyzing protein structure data."
+		},
+		concatenate: {
+			name: "rcsb_pdb_concatenate_strings",
+			description: "Concatenate string arrays from staged RCSB PDB data tables. Use this tool to combine data from specific columns across rows into formatted string arrays. Useful for creating lists, generating reports, or formatting data for further processing. Requires data_access_id from rcsb_pdb_graphql_query."
 		}
 	}
 };
@@ -151,6 +155,27 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 					return { content: [{ type: "text" as const, text: JSON.stringify(queryResult, null, 2) }] };
 				} catch (error) {
 					return this.createErrorResponse("SQL execution failed", error);
+				}
+			}
+		);
+
+		this.server.tool(
+			API_CONFIG.tools.concatenate.name,
+			API_CONFIG.tools.concatenate.description,
+			{
+				data_access_id: z.string().describe("Data access ID from the GraphQL query tool"),
+				table_name: z.string().describe("Name of the table to query for concatenation"),
+				columns: z.array(z.string()).describe("Array of column names to concatenate for each row"),
+				separator: z.string().optional().describe("Separator between concatenated column values within each row (default: space)"),
+				where_clause: z.string().optional().describe("Optional WHERE clause to filter rows (without the 'WHERE' keyword)"),
+				row_limit: z.number().optional().describe("Maximum number of rows to process (default: no limit)"),
+			},
+			async ({ data_access_id, table_name, columns, separator, where_clause, row_limit }) => {
+				try {
+					const result = await this.concatenateStrings(data_access_id, table_name, columns, separator, where_clause, row_limit);
+					return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+				} catch (error) {
+					return this.createErrorResponse("String concatenation failed", error);
 				}
 			}
 		);
@@ -449,6 +474,35 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 		
                 return await response.json();
         }
+
+        private async concatenateStrings(dataAccessId: string, tableName: string, columns: string[], separator?: string, whereClause?: string, rowLimit?: number): Promise<any> {
+		const env = this.env as RcsbPdbEnv;
+		if (!env?.JSON_TO_SQL_DO) {
+			throw new Error("JSON_TO_SQL_DO binding not available");
+		}
+
+		const doId = env.JSON_TO_SQL_DO.idFromName(dataAccessId);
+		const stub = env.JSON_TO_SQL_DO.get(doId);
+
+		const response = await stub.fetch("http://do/concatenate", {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				table_name: tableName,
+				columns,
+				separator,
+				where_clause: whereClause,
+				row_limit: rowLimit
+			})
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`Concatenation failed: ${errorText}`);
+		}
+
+		return await response.json();
+	}
 
         private async deleteDataset(dataAccessId: string): Promise<boolean> {
                 const env = this.env as RcsbPdbEnv;

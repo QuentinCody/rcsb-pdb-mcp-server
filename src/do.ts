@@ -873,6 +873,69 @@ export class JsonToSqlDO extends DurableObject {
 		}
 	}
 
+	async concatenateStrings(tableName: string, columns: string[], separator: string = ' ', whereClause?: string, rowLimit?: number): Promise<any> {
+		try {
+			if (!tableName || !columns || columns.length === 0) {
+				return { success: false, error: "Table name and columns are required." };
+			}
+	
+			// Validate table and column names to prevent SQL injection
+			const validTableName = this.validateAndFixIdentifier(tableName, 'table');
+			const validColumns = columns.map(c => this.validateAndFixIdentifier(c, 'column'));
+	
+			let query = `SELECT ${validColumns.join(', ')} FROM ${validTableName}`;
+	
+			if (whereClause) {
+				const blockedPatterns = [
+					/\bdrop\s+table/i,
+					/\bdelete\s+from/i,
+					/\bupdate\s+\w+\s+set/i,
+					/\binsert\s+into/i,
+					/\balter\s+table/i,
+					/\bcreate\s+table/i,
+					/\battach\s+database/i,
+					/\bdetach\s+database/i
+				];
+	
+				for (const pattern of blockedPatterns) {
+					if (pattern.test(whereClause)) {
+						return { success: false, error: `Operation blocked for security in where_clause: ${pattern.source}.` };
+					}
+				}
+				query += ` WHERE ${whereClause}`;
+			}
+	
+			if (rowLimit) {
+				query += ` LIMIT ${Number(rowLimit)}`;
+			}
+	
+			const result = this.ctx.storage.sql.exec(query);
+			const rows = result.toArray();
+	
+			const concatenated = rows.map((row: any) => {
+				return validColumns.map(col => row[col]).join(separator);
+			});
+	
+			return {
+				success: true,
+				concatenated_strings: concatenated,
+				row_count: concatenated.length
+			};
+	
+		} catch (error) {
+			return {
+				success: false,
+				error: error instanceof Error ? error.message : "String concatenation failed",
+				suggestions: [
+					`Verify table name: ${tableName}`,
+					`Verify column names: ${columns.join(', ')}`,
+					"Use PRAGMA table_list to see all available tables",
+					`Use PRAGMA table_info(${tableName}) to see available columns`
+				]
+			};
+		}
+	}
+
 	async getStats(): Promise<any> {
 		return {
 			success: true,
@@ -934,6 +997,18 @@ export class JsonToSqlDO extends DurableObject {
 				});
 			} else if (url.pathname === '/stats' && request.method === 'GET') {
 				const result = await this.getStats();
+				return new Response(JSON.stringify(result), {
+					headers: { 'Content-Type': 'application/json' }
+				});
+			} else if (url.pathname === '/concatenate' && request.method === 'POST') {
+				const { table_name, columns, separator, where_clause, row_limit } = await request.json() as {
+					table_name: string,
+					columns: string[],
+					separator?: string,
+					where_clause?: string,
+					row_limit?: number
+				};
+				const result = await this.concatenateStrings(table_name, columns, separator, where_clause, row_limit);
 				return new Response(JSON.stringify(result), {
 					headers: { 'Content-Type': 'application/json' }
 				});
