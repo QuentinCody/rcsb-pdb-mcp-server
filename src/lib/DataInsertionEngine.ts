@@ -183,7 +183,7 @@ export class DataInsertionEngine {
 			
 			return insertedId;
 		} catch (error) {
-			console.error(`Error inserting entity into ${tableName}:`, error);
+			console.log(`Error inserting entity into ${tableName}:`, error);
 			return null;
 		}
 	}
@@ -279,7 +279,7 @@ export class DataInsertionEngine {
 					sql.exec(updateSQL, update.value, entityInfo.id);
 				}
 			} catch (error) {
-				console.error(`Error updating foreign key ${entityInfo.tableName}.${update.column}:`, error);
+				console.log(`Error updating foreign key ${entityInfo.tableName}.${update.column}:`, error);
 			}
 		}
 	}
@@ -474,7 +474,7 @@ export class DataInsertionEngine {
 										try {
 											sql.exec(insertSQL, entityInfo.id, relatedEntityInfo.id);
 										} catch (error) {
-											console.error(`Error creating junction relationship in ${junctionTableName}:`, error);
+											console.log(`Error creating junction relationship in ${junctionTableName}:`, error);
 										}
 									}
 								}
@@ -491,7 +491,7 @@ export class DataInsertionEngine {
 								try {
 									sql.exec(insertSQL, entityInfo.id, relatedEntityInfo.id);
 								} catch (error) {
-									console.error(`Error creating junction relationship (1:1) in ${junctionTableName}:`, error);
+									console.log(`Error creating junction relationship (1:1) in ${junctionTableName}:`, error);
 								}
 							}
 						}

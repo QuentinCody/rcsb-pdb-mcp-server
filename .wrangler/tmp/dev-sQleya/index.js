@@ -469,6 +469,7 @@ var Process = class _Process extends EventEmitter {
       }
     }
   }
+  // --- event emitter ---
   emitWarning(warning, type, code) {
     console.warn(`${code ? `[${code}] ` : ""}${type ? `${type}: ` : ""}${warning}`);
   }
@@ -478,6 +479,7 @@ var Process = class _Process extends EventEmitter {
   listeners(eventName) {
     return super.listeners(eventName);
   }
+  // --- stdio (lazy initializers) ---
   #stdin;
   #stdout;
   #stderr;
@@ -490,6 +492,7 @@ var Process = class _Process extends EventEmitter {
   get stderr() {
     return this.#stderr ??= new WriteStream(2);
   }
+  // --- cwd ---
   #cwd = "/";
   chdir(cwd2) {
     this.#cwd = cwd2;
@@ -497,6 +500,7 @@ var Process = class _Process extends EventEmitter {
   cwd() {
     return this.#cwd;
   }
+  // --- dummy props and getters ---
   arch = "";
   platform = "";
   argv = [];
@@ -554,10 +558,12 @@ var Process = class _Process extends EventEmitter {
   resourceUsage() {
     return {};
   }
+  // --- noop methods ---
   ref() {
   }
   unref() {
   }
+  // --- unimplemented methods ---
   umask() {
     throw createNotImplementedError("process.umask");
   }
@@ -612,6 +618,7 @@ var Process = class _Process extends EventEmitter {
   binding() {
     throw createNotImplementedError("process.binding");
   }
+  // --- attached interfaces ---
   permission = { has: /* @__PURE__ */ notImplemented("process.permission.has") };
   report = {
     directory: "",
@@ -636,8 +643,10 @@ var Process = class _Process extends EventEmitter {
     heapTotal: 0,
     heapUsed: 0
   }), { rss: /* @__PURE__ */ __name(() => 0, "rss") });
+  // --- undefined props ---
   mainModule = void 0;
   domain = void 0;
+  // optional
   send = void 0;
   exitCode = void 0;
   channel = void 0;
@@ -651,6 +660,7 @@ var Process = class _Process extends EventEmitter {
   setgid = void 0;
   setgroups = void 0;
   setuid = void 0;
+  // internals
   _events = void 0;
   _eventsCount = void 0;
   _exiting = void 0;
@@ -1901,11 +1911,8 @@ function parseCronExpression(cronExpression) {
 }
 __name(parseCronExpression, "parseCronExpression");
 
-// ../../../opt/homebrew/lib/node_modules/wrangler/node_modules/@cloudflare/unenv-preset/dist/runtime/node/async_hooks.mjs
-var workerdAsyncHooks = process.getBuiltinModule("node:async_hooks");
-var { AsyncLocalStorage, AsyncResource } = workerdAsyncHooks;
-
 // node_modules/agents/dist/chunk-XG52S6YY.js
+import { AsyncLocalStorage } from "node:async_hooks";
 function isRPCRequest(msg) {
   return typeof msg === "object" && msg !== null && "type" in msg && msg.type === "rpc" && "id" in msg && typeof msg.id === "string" && "method" in msg && typeof msg.method === "string" && "args" in msg && Array.isArray(msg.args);
 }
@@ -11361,7 +11368,7 @@ var DataInsertionEngine = class {
       }
       return insertedId;
     } catch (error3) {
-      console.error(`Error inserting entity into ${tableName}:`, error3);
+      console.log(`Error inserting entity into ${tableName}:`, error3);
       return null;
     }
   }
@@ -11430,7 +11437,7 @@ var DataInsertionEngine = class {
           sql.exec(updateSQL, update.value, entityInfo.id);
         }
       } catch (error3) {
-        console.error(`Error updating foreign key ${entityInfo.tableName}.${update.column}:`, error3);
+        console.log(`Error updating foreign key ${entityInfo.tableName}.${update.column}:`, error3);
       }
     }
   }
@@ -11570,7 +11577,7 @@ var DataInsertionEngine = class {
                     try {
                       sql.exec(insertSQL, entityInfo.id, relatedEntityInfo.id);
                     } catch (error3) {
-                      console.error(`Error creating junction relationship in ${junctionTableName}:`, error3);
+                      console.log(`Error creating junction relationship in ${junctionTableName}:`, error3);
                     }
                   }
                 }
@@ -11586,7 +11593,7 @@ var DataInsertionEngine = class {
                 try {
                   sql.exec(insertSQL, entityInfo.id, relatedEntityInfo.id);
                 } catch (error3) {
-                  console.error(`Error creating junction relationship (1:1) in ${junctionTableName}:`, error3);
+                  console.log(`Error creating junction relationship (1:1) in ${junctionTableName}:`, error3);
                 }
               }
             }
@@ -13071,7 +13078,7 @@ var RcsbPdbMCP = class extends McpAgent {
     __name(this, "RcsbPdbMCP");
   }
   async init() {
-    console.error("RCSB PDB MCP Server initialized.");
+    console.log("RCSB PDB MCP Server initialized.");
     this.server.tool(
       API_CONFIG.tools.graphql.name,
       API_CONFIG.tools.graphql.description,
@@ -13157,13 +13164,13 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
       if (variables && Object.keys(variables).length > 0) {
         bodyData.variables = variables;
       }
-      console.error(`Making GraphQL request to: ${API_CONFIG.endpoint}`);
+      console.log(`Making GraphQL request to: ${API_CONFIG.endpoint}`);
       const response = await fetch(API_CONFIG.endpoint, {
         method: "POST",
         headers,
         body: JSON.stringify(bodyData)
       });
-      console.error(`RCSB PDB API response status: ${response.status}`);
+      console.log(`RCSB PDB API response status: ${response.status}`);
       if (!response.ok) {
         let errorText = `RCSB PDB API HTTP Error ${response.status}`;
         try {
@@ -13420,8 +13427,33 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 var src_default = {
   async fetch(request, env2, ctx) {
     const url = new URL(request.url);
+    if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+      const protocolVersion = request.headers.get("MCP-Protocol-Version");
+      const response = await RcsbPdbMCP.serve("/mcp").fetch(request, env2, ctx);
+      if (protocolVersion && response instanceof Response) {
+        const headers = new Headers(response.headers);
+        headers.set("MCP-Protocol-Version", protocolVersion);
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers
+        });
+      }
+      return response;
+    }
     if (url.pathname === "/sse" || url.pathname.startsWith("/sse/")) {
-      return RcsbPdbMCP.serveSSE("/sse").fetch(request, env2, ctx);
+      const protocolVersion = request.headers.get("MCP-Protocol-Version");
+      const response = await RcsbPdbMCP.serveSSE("/sse").fetch(request, env2, ctx);
+      if (protocolVersion && response instanceof Response) {
+        const headers = new Headers(response.headers);
+        headers.set("MCP-Protocol-Version", protocolVersion);
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers
+        });
+      }
+      return response;
     }
     if (url.pathname === "/datasets" && request.method === "GET") {
       const list = Array.from(datasetRegistry.entries()).map(([id, info3]) => ({
@@ -13456,7 +13488,11 @@ var src_default = {
       });
     }
     return new Response(
-      `${API_CONFIG.name} - Available on /sse endpoint
+      `${API_CONFIG.name} - MCP Server
+Available endpoints:
+- /mcp (Streamable HTTP transport - recommended)
+- /sse (SSE transport - legacy support)
+
 RCSB PDB GraphQL API with SQLite staging for complex data analysis`,
       { status: 404, headers: { "Content-Type": "text/plain" } }
     );
@@ -13504,7 +13540,7 @@ var jsonError = /* @__PURE__ */ __name(async (request, env2, _ctx, middlewareCtx
 }, "jsonError");
 var middleware_miniflare3_json_error_default = jsonError;
 
-// .wrangler/tmp/bundle-fhPXkp/middleware-insertion-facade.js
+// .wrangler/tmp/bundle-TQHoWW/middleware-insertion-facade.js
 var __INTERNAL_WRANGLER_MIDDLEWARE__ = [
   middleware_ensure_req_body_drained_default,
   middleware_miniflare3_json_error_default
@@ -13536,7 +13572,7 @@ function __facade_invoke__(request, env2, ctx, dispatch, finalMiddleware) {
 }
 __name(__facade_invoke__, "__facade_invoke__");
 
-// .wrangler/tmp/bundle-fhPXkp/middleware-loader.entry.ts
+// .wrangler/tmp/bundle-TQHoWW/middleware-loader.entry.ts
 var __Facade_ScheduledController__ = class ___Facade_ScheduledController__ {
   constructor(scheduledTime, cron, noRetry) {
     this.scheduledTime = scheduledTime;
