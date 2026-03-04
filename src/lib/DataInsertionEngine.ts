@@ -469,10 +469,12 @@ export class DataInsertionEngine {
 								for (const relatedEntity of entityItems) {
 									const relatedEntityInfo = this.entityToRowMap.get(relatedEntity);
 									if (relatedEntityInfo) {
-										const insertSQL = `INSERT OR IGNORE INTO ${junctionTableName} (${entityInfo.tableName}_id, ${relatedEntityInfo.tableName}_id) VALUES (?, ?)`;
-										console.log(`Creating junction table relationship: ${insertSQL}`, [entityInfo.id, relatedEntityInfo.id]);
+										const [sortedA, sortedB] = [entityInfo.tableName, relatedEntityInfo.tableName].sort();
+										const idA = sortedA === entityInfo.tableName ? entityInfo.id : relatedEntityInfo.id;
+										const idB = sortedA === entityInfo.tableName ? relatedEntityInfo.id : entityInfo.id;
+										const insertSQL = `INSERT OR IGNORE INTO ${junctionTableName} (${sortedA}_id, ${sortedB}_id) VALUES (?, ?)`;
 										try {
-											sql.exec(insertSQL, entityInfo.id, relatedEntityInfo.id);
+											sql.exec(insertSQL, idA, idB);
 										} catch (error) {
 											console.log(`Error creating junction relationship in ${junctionTableName}:`, error);
 										}
@@ -486,10 +488,12 @@ export class DataInsertionEngine {
 						if (relatedEntityInfo && relatedEntityInfo.tableName !== entityInfo.tableName) {
 							const junctionTableName = this.getJunctionTableName(entityInfo.tableName, relatedEntityInfo.tableName);
 							if (schemas[junctionTableName]) {
-								const insertSQL = `INSERT OR IGNORE INTO ${junctionTableName} (${entityInfo.tableName}_id, ${relatedEntityInfo.tableName}_id) VALUES (?, ?)`;
-								console.log(`Creating junction table relationship (1:1): ${insertSQL}`, [entityInfo.id, relatedEntityInfo.id]);
+								const [sortedA, sortedB] = [entityInfo.tableName, relatedEntityInfo.tableName].sort();
+								const idA = sortedA === entityInfo.tableName ? entityInfo.id : relatedEntityInfo.id;
+								const idB = sortedA === entityInfo.tableName ? relatedEntityInfo.id : entityInfo.id;
+								const insertSQL = `INSERT OR IGNORE INTO ${junctionTableName} (${sortedA}_id, ${sortedB}_id) VALUES (?, ?)`;
 								try {
-									sql.exec(insertSQL, entityInfo.id, relatedEntityInfo.id);
+									sql.exec(insertSQL, idA, idB);
 								} catch (error) {
 									console.log(`Error creating junction relationship (1:1) in ${junctionTableName}:`, error);
 								}

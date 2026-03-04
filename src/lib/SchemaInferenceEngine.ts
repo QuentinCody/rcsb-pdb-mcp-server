@@ -625,19 +625,20 @@ export class SchemaInferenceEngine {
 	
 	private createJunctionTableSchemas(schemas: Record<string, TableSchema>): void {
 		const junctionTables = new Set<string>();
-		
+
 		for (const [fromTable, relatedTables] of this.entityRelationships.entries()) {
 			for (const toTable of relatedTables) {
-				const junctionName = [fromTable, toTable].sort().join('_');
-				
+				const [sortedA, sortedB] = [fromTable, toTable].sort();
+				const junctionName = `${sortedA}_${sortedB}`;
+
 				if (!junctionTables.has(junctionName)) {
 					junctionTables.add(junctionName);
-					
+
 					schemas[junctionName] = {
 						columns: {
 							id: 'INTEGER PRIMARY KEY AUTOINCREMENT',
-							[`${fromTable}_id`]: `INTEGER REFERENCES ${fromTable}(id)`,
-							[`${toTable}_id`]: `INTEGER REFERENCES ${toTable}(id)`
+							[`${sortedA}_id`]: `INTEGER REFERENCES ${sortedA}(id)`,
+							[`${sortedB}_id`]: `INTEGER REFERENCES ${sortedB}(id)`
 						},
 						sample_data: []
 					};

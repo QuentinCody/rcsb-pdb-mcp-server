@@ -121,7 +121,7 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
                                                 return {
                                                         content: [{
                                                                 type: "text" as const,
-                                                                text: JSON.stringify(graphqlResult, null, 2)
+                                                                text: JSON.stringify(graphqlResult)
                                                         }]
                                                 };
                                         }
@@ -130,7 +130,7 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
                                         return {
                                                 content: [{
                                                         type: "text" as const,
-                                                        text: JSON.stringify(stagingResult, null, 2)
+                                                        text: JSON.stringify(stagingResult)
                                                 }]
                                         };
 
@@ -152,7 +152,7 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 			async ({ data_access_id, sql }) => {
 				try {
 					const queryResult = await this.executeSQLQuery(data_access_id, sql);
-					return { content: [{ type: "text" as const, text: JSON.stringify(queryResult, null, 2) }] };
+					return { content: [{ type: "text" as const, text: JSON.stringify(queryResult) }] };
 				} catch (error) {
 					return this.createErrorResponse("SQL execution failed", error);
 				}
@@ -173,7 +173,7 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 			async ({ data_access_id, table_name, columns, separator, where_clause, row_limit }) => {
 				try {
 					const result = await this.concatenateStrings(data_access_id, table_name, columns, separator, where_clause, row_limit);
-					return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+					return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
 				} catch (error) {
 					return this.createErrorResponse("String concatenation failed", error);
 				}
@@ -529,7 +529,7 @@ Example data query: '{ entry(entry_id:"4HHB") { struct { title } exptl { method 
 					success: false,
 					error: message,
 					details: error instanceof Error ? error.message : String(error)
-				}, null, 2)
+				})
 			}]
 		};
 	}
@@ -559,7 +559,7 @@ export default {
                         const protocolVersion = request.headers.get("MCP-Protocol-Version");
                         
                         // Use RcsbPdbMCP.serve() for Streamable HTTP transport
-                        const response = await RcsbPdbMCP.serve("/mcp").fetch(request, env, ctx);
+                        const response = await RcsbPdbMCP.serve("/mcp", { binding: "MCP_OBJECT" }).fetch(request, env, ctx);
                         
                         // Add protocol version header if provided in request
                         if (protocolVersion && response instanceof Response) {
@@ -580,7 +580,7 @@ export default {
                         const protocolVersion = request.headers.get("MCP-Protocol-Version");
                         
                         // @ts-ignore - SSE transport handling
-                        const response = await RcsbPdbMCP.serveSSE("/sse").fetch(request, env, ctx);
+                        const response = await RcsbPdbMCP.serveSSE("/sse", { binding: "MCP_OBJECT" }).fetch(request, env, ctx);
                         
                         if (protocolVersion && response instanceof Response) {
                                 const headers = new Headers(response.headers);
@@ -600,7 +600,7 @@ export default {
                                 data_access_id: id,
                                 ...info
                         }));
-                        return new Response(JSON.stringify({ datasets: list }, null, 2), {
+                        return new Response(JSON.stringify({ datasets: list }), {
                                 headers: { "Content-Type": "application/json" }
                         });
                 }

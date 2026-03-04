@@ -21,6 +21,20 @@ export class JsonToSqlDO extends DurableObject {
 	async processAndStoreJson(jsonData: any, sourceQuery?: string): Promise<ProcessingResult> {
 		try {
 			let dataToProcess = jsonData?.data ? jsonData.data : jsonData;
+
+			// Unwrap single-key wrapper objects from GraphQL responses like { entry: { ... } }
+			// This ensures single-entry queries (e.g., entry(entry_id: "4XUF")) get staged correctly
+			if (dataToProcess && typeof dataToProcess === 'object' && !Array.isArray(dataToProcess)) {
+				const keys = Object.keys(dataToProcess);
+				if (keys.length === 1) {
+					const inner = dataToProcess[keys[0]];
+					if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+						// Single object response — wrap in array for consistent entity processing
+						dataToProcess = { [keys[0]]: [inner] };
+					}
+				}
+			}
+
 			const paginationInfo = PaginationAnalyzer.extractInfo(dataToProcess);
 
 			// Enhanced validation with helpful feedback
@@ -77,9 +91,7 @@ export class JsonToSqlDO extends DurableObject {
 				message: "Data processed successfully",
 				table_count: Object.keys(schemas).length,
 				total_rows: metadata.total_rows || 0,
-				schemas: metadata.schemas,
-				processing_guidance: this.generateProcessingGuidance(schemas),
-				query_guidance: metadata.query_guidance
+				schemas: metadata.schemas
 			};
 			
 			// Add pagination if available
@@ -121,24 +133,12 @@ export class JsonToSqlDO extends DurableObject {
 			// Update stats
 			this.processingStats.queriesExecuted++;
 
-			// Enhanced response with analysis hints
-			const response = {
+			return {
 				success: true,
 				results,
 				row_count: results.length,
 				column_names: result.columnNames || [],
-				query_type: validationResult.queryType,
-				execution_hints: this.generateExecutionHints(sqlQuery, results.length),
-				performance_notes: this.generatePerformanceNotes(sqlQuery, results.length)
 			};
-
-			// Add discovery suggestions for empty results
-			if (results.length === 0) {
-				response.execution_hints.push("No rows returned - try PRAGMA table_info(table_name) to verify structure");
-				response.execution_hints.push("Use /schema endpoint to see all available tables and data");
-			}
-
-			return response;
 
 		} catch (error) {
 			return this.createSqlError(
@@ -540,37 +540,16 @@ export class JsonToSqlDO extends DurableObject {
 				const countRow = countResult.one();
 				const rowCount = typeof countRow?.count === 'number' ? countRow.count : 0;
 
-				const sampleResult = this.ctx.storage.sql.exec(`SELECT * FROM ${tableName} LIMIT 3`);
-				const sampleData = sampleResult.toArray();
-
 				metadata.schemas[tableName] = {
-					columns: schema.columns,
-					row_count: rowCount,
-					sample_data: sampleData,
-					suggested_queries: [
-						`SELECT * FROM ${tableName} LIMIT 10`,
-						`SELECT COUNT(*) FROM ${tableName}`,
-						`PRAGMA table_info(${tableName})`
-					]
+					columns: Object.keys(schema.columns),
+					row_count: rowCount
 				};
 
 				metadata.total_rows += rowCount;
 
-				// Add contextual guidance
-				if (rowCount > 0) {
-					metadata.query_guidance.next_steps.push(`Explore ${tableName} (${rowCount} rows)`);
-					metadata.query_guidance.recommended_queries.push(`SELECT * FROM ${tableName} LIMIT 5`);
-				}
-
 			} catch (error) {
-				// Continue with other tables on error but note the issue
-				metadata.schemas[tableName] = {
-					columns: schema.columns,
-					row_count: 0,
-					sample_data: [],
-					error: "Could not access table data",
-					suggested_queries: [`PRAGMA table_info(${tableName})`]
-				};
+				// Continue with other tables on error
+				continue;
 			}
 		}
 
@@ -633,9 +612,6 @@ export class JsonToSqlDO extends DurableObject {
 					const countResult = this.ctx.storage.sql.exec(`SELECT COUNT(*) as count FROM ${tableName}`).one();
 					const rowCount = typeof countResult?.count === 'number' ? countResult.count : 0;
 					
-					// Get sample data (first 3 rows)
-					const sampleData = this.ctx.storage.sql.exec(`SELECT * FROM ${tableName} LIMIT 3`).toArray();
-					
 					// Get foreign key information
 					const foreignKeys = this.ctx.storage.sql.exec(`PRAGMA foreign_key_list(${tableName})`).toArray();
 					
@@ -661,12 +637,6 @@ export class JsonToSqlDO extends DurableObject {
 							name: String(idx.name),
 							unique: Boolean(idx.unique)
 						})),
-						sample_data: sampleData,
-						recommended_starter_queries: [
-							`SELECT * FROM ${tableName} LIMIT 5`,
-							`SELECT COUNT(*) FROM ${tableName}`,
-							...(rowCount > 0 ? [`SELECT * FROM ${tableName} WHERE ${columns[0]?.name} IS NOT NULL LIMIT 10`] : [])
-						]
 					};
 				} catch (tableError) {
 					schemaInfo.tables[tableName] = {
